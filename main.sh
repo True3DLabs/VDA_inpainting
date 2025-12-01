@@ -207,17 +207,18 @@ if scene_depth_stats_file and scene_depth_stats_file.exists():
         scene_max_depths = depth_stats.get('scene_max_depths', [])
 
 # Ensure arrays match scene count
-scene_count = len(scene_timestamps) if scene_timestamps else 0
-if scene_count > 0:
-    # Pad depth arrays if needed
-    while len(scene_min_depths) < scene_count:
-        scene_min_depths.append(0.0)
-    while len(scene_max_depths) < scene_count:
-        scene_max_depths.append(10.0)
-    # Create scene_fovs array (default 60)
-    scene_fovs = [60.0] * scene_count
-else:
-    scene_fovs = []
+# Default to 1 scene starting at 0.0 if no scenes detected
+if not scene_timestamps or len(scene_timestamps) == 0:
+    scene_timestamps = [0.0]
+
+scene_count = len(scene_timestamps) if scene_timestamps else 1
+
+# Use real depth stats from VDA - don't pad with defaults
+# If depth stats don't match scene count, that's okay - they'll be updated after VDA runs
+# The depth stats will have real metric depth values, not placeholder defaults
+
+# Create scene_fovs array (default 60)
+scene_fovs = [60.0] * scene_count
 
 # Update metadata
 metadata.update({
@@ -358,8 +359,8 @@ else
     echo "rgb.mp4 already exists, skipping creation" | tee -a "$LOG_FILE"
 fi
 
-# Step 3: Scene detection (if scene_timestamps not in metadata.json)
-if ! python3 -c "import json; data = json.load(open('$METADATA_FILE')); exit(0 if 'scene_timestamps' in data and data['scene_timestamps'] else 1)" 2>/dev/null; then
+# Step 3: Scene detection (if scene_timestamps not in metadata.json or empty)
+if ! python3 -c "import json; data = json.load(open('$METADATA_FILE')); timestamps = data.get('scene_timestamps', []); exit(0 if timestamps and len(timestamps) > 0 else 1)" 2>/dev/null; then
     echo "Detecting scenes..." | tee -a "$LOG_FILE"
     
     if [ ! -f "$SCENE_SPLIT_SCRIPT" ]; then
@@ -374,7 +375,7 @@ if ! python3 -c "import json; data = json.load(open('$METADATA_FILE')); exit(0 i
     fi
     SCENE_SPLIT_ARGS+=("--output-timestamps" "$TEMP_TIMESTAMPS")
     
-    if ! python3 "$SCENE_SPLIT_SCRIPT" "${SCENE_SPLIT_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+    if ! micromamba run -n da3 python "$SCENE_SPLIT_SCRIPT" "${SCENE_SPLIT_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
         echo "Error: Failed to detect scenes" >&2
         exit 1
     fi
@@ -400,6 +401,10 @@ if temp_timestamps_file.exists():
     with open(temp_timestamps_file, 'r') as f:
         scene_timestamps = json.load(f)
 
+# Default to 1 scene starting at 0.0 if no scenes detected
+if not scene_timestamps or len(scene_timestamps) == 0:
+    scene_timestamps = [0.0]
+
 # Update metadata with scene timestamps
 metadata['scene_timestamps'] = scene_timestamps
 metadata['scene_count'] = len(scene_timestamps)
@@ -414,7 +419,7 @@ EOF
         rm -rf "${ROOT_DIR}/scenes_temp"
         echo "Scene detection complete" | tee -a "$LOG_FILE"
     else
-        echo "Warning: Scene timestamps file not created, adding empty scene_timestamps to metadata.json" | tee -a "$LOG_FILE"
+        echo "Warning: Scene timestamps file not created, defaulting to 1 scene starting at 0.0" | tee -a "$LOG_FILE"
         python3 <<EOF
 import json
 from pathlib import Path
@@ -425,8 +430,9 @@ if metadata_file.exists():
     with open(metadata_file, 'r') as f:
         metadata = json.load(f)
 
-metadata['scene_timestamps'] = []
-metadata['scene_count'] = 0
+# Default to 1 scene starting at 0.0
+metadata['scene_timestamps'] = [0.0]
+metadata['scene_count'] = 1
 
 with open(metadata_file, 'w') as f:
     json.dump(metadata, f, indent=2)
@@ -487,6 +493,12 @@ if [ "$NO_DEPTH" = false ]; then
         # Update metadata with depth dimensions and scene information
         update_metadata_with_scenes "$METADATA_FILE" "$INPUT_VIDEO" "$FRAMES_DIR" "$SCENE_DEPTH_STATS_FILE"
         echo "Metadata updated with depth dimensions and scene information" | tee -a "$LOG_FILE"
+        
+        # Clean up temporary scene depth stats file
+        if [ -f "$SCENE_DEPTH_STATS_FILE" ]; then
+            rm -f "$SCENE_DEPTH_STATS_FILE"
+            echo "Cleaned up temporary scene depth stats file" | tee -a "$LOG_FILE"
+        fi
     else
         echo "depth.mp4 already exists, skipping VDA" | tee -a "$LOG_FILE"
         # Update metadata with depth dimensions and scene information if not already present
@@ -494,6 +506,12 @@ if [ "$NO_DEPTH" = false ]; then
         if ! python3 -c "import json; data = json.load(open('$METADATA_FILE')); exit(0 if 'depth_width' in data and 'scene_timestamps' in data else 1)" 2>/dev/null; then
             update_metadata_with_scenes "$METADATA_FILE" "$INPUT_VIDEO" "$FRAMES_DIR" "$SCENE_DEPTH_STATS_FILE"
             echo "Metadata updated with depth dimensions and scene information" | tee -a "$LOG_FILE"
+            
+            # Clean up temporary scene depth stats file
+            if [ -f "$SCENE_DEPTH_STATS_FILE" ]; then
+                rm -f "$SCENE_DEPTH_STATS_FILE"
+                echo "Cleaned up temporary scene depth stats file" | tee -a "$LOG_FILE"
+            fi
         fi
     fi
 else
