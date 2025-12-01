@@ -67,7 +67,11 @@ node_modules/
 *.pkl
 *.pickle
 
-# But allow .gitignore itself
+# But allow .gitignore itself and documentation
 !.gitignore
 !.gitattributes
+!README.md
+!README.txt
+!LICENSE
+!LICENSE.txt
 
