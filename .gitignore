@@ -1,0 +1,73 @@
+# Ignore everything by default
+*
+
+# But include root-level Python and Shell scripts
+!*.py
+!*.sh
+
+# Exclude nested directories (they may contain their own git repos)
+!*/
+**/
+
+# Exclude common build/cache directories
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Exclude IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Exclude OS files
+.DS_Store
+Thumbs.db
+
+# Exclude outputs and temporary files
+outputs/
+processing/
+*.log
+*.tmp
+*.temp
+
+# Exclude environment files
+.env
+.venv
+venv/
+env/
+
+# Exclude node_modules if any
+node_modules/
+
+# Exclude video files
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Exclude image files
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Exclude data files
+*.npz
+*.npy
+*.pkl
+*.pickle
+
+# But allow .gitignore itself
+!.gitignore
+!.gitattributes
+
