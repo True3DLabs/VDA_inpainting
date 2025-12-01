@@ -10,6 +10,7 @@ MAX_RES=1280
 MAX_LEN=""
 NO_DEPTH=false
 NO_EXPORT=false
+SAVE_NPZ=false
 
 # Parse arguments
 INPUT=""
@@ -25,6 +26,8 @@ while [ $# -gt 0 ]; do
       NO_DEPTH=true; shift ;;
     --no-export)
       NO_EXPORT=true; shift ;;
+    --npz)
+      SAVE_NPZ=true; shift ;;
     --help|-h)
       cat >&2 <<USAGE
 Usage: $0 <input_video_or_folder> [options]
@@ -35,6 +38,7 @@ Options:
   --max-len N       Maximum length in seconds to clip video (default: no limit)
   --no-depth        Skip depth estimation (VDA)
   --no-export       Skip export.zip creation
+  --npz             Save raw metric depth values to depth.npz (unquantized)
   --help            Show this help message
 
 The script can be run on:
@@ -101,8 +105,9 @@ fi
 
 FRAMES_DIR="${ROOT_DIR}/frames"
 METADATA_FILE="${ROOT_DIR}/metadata.json"
-RGB_VIDEO="${ROOT_DIR}/rgb.mp4"
+REFERENCE_VIDEO="${ROOT_DIR}/rgb.mp4"
 DEPTH_VIDEO="${ROOT_DIR}/depth.mp4"
+DEPTH_NPZ="${ROOT_DIR}/depth.npz"
 LOG_FILE="${ROOT_DIR}/log.txt"
 SCENE_SPLIT_SCRIPT="${SCRIPT_DIR}/scene_split.py"
 
@@ -306,9 +311,50 @@ create_metadata() {
     } > "$metadata_file"
 }
 
-# Step 1: Extract frames and create metadata (if new run or frames don't exist)
+# Step 1: Create reference video FIRST (needed for frame extraction timing)
+# This is done early so frame extraction can use it
+if [ ! -f "$REFERENCE_VIDEO" ]; then
+    echo "Creating rgb.mp4 (re-encoded to match MAX_FPS if needed)..." | tee -a "$LOG_FILE"
+    
+    extract_video_metadata "$INPUT_VIDEO"
+    
+    # Re-encode input video to actual_fps (min of original and MAX_FPS) if needed
+    # This ensures consistent timing for all downstream processing
+    # Keep original resolution, use h264, and apply MAX_LEN if specified
+    FFMPEG_CMD=(ffmpeg -i "$INPUT_VIDEO" -vf "fps=fps=${METADATA_ACTUAL_FPS}" -c:v libx264 -pix_fmt yuv420p -crf 18)
+    if [ -n "$MAX_LEN" ]; then
+        FFMPEG_CMD+=(-t "$MAX_LEN")
+    fi
+    FFMPEG_CMD+=(-y "$REFERENCE_VIDEO")
+    if ! "${FFMPEG_CMD[@]}" >/dev/null 2>&1; then
+        echo "Error: Failed to create rgb.mp4" >&2
+        exit 1
+    fi
+    
+    echo "rgb.mp4 created: $REFERENCE_VIDEO" | tee -a "$LOG_FILE"
+    
+    # Extract exact properties from rgb.mp4 for downstream use
+    extract_video_metadata "$REFERENCE_VIDEO"
+    REFERENCE_FPS=$METADATA_ACTUAL_FPS
+    REFERENCE_DURATION=$METADATA_DURATION
+    REFERENCE_FRAMES=$METADATA_NUM_FRAMES
+    
+    echo "rgb.mp4 properties:" | tee -a "$LOG_FILE"
+    echo "  FPS: $REFERENCE_FPS" | tee -a "$LOG_FILE"
+    echo "  Duration: ${REFERENCE_DURATION}s" | tee -a "$LOG_FILE"
+    echo "  Frames: ${REFERENCE_FRAMES:-N/A}" | tee -a "$LOG_FILE"
+else
+    echo "rgb.mp4 already exists, extracting properties..." | tee -a "$LOG_FILE"
+    extract_video_metadata "$REFERENCE_VIDEO"
+    REFERENCE_FPS=$METADATA_ACTUAL_FPS
+    REFERENCE_DURATION=$METADATA_DURATION
+    REFERENCE_FRAMES=$METADATA_NUM_FRAMES
+fi
+
+# Step 2: Extract frames and create metadata (if new run or frames don't exist)
+# Use rgb.mp4 to ensure frames match timing exactly
 if [ "$IS_NEW_RUN" = true ] || [ ! -d "$FRAMES_DIR" ] || [ -z "$(ls -A "$FRAMES_DIR" 2>/dev/null)" ]; then
-    echo "Extracting frames from video..." | tee -a "$LOG_FILE"
+    echo "Extracting frames from rgb.mp4..." | tee -a "$LOG_FILE"
     mkdir -p "$FRAMES_DIR"
     
     if ! command -v ffmpeg &> /dev/null; then
@@ -316,14 +362,11 @@ if [ "$IS_NEW_RUN" = true ] || [ ! -d "$FRAMES_DIR" ] || [ -z "$(ls -A "$FRAMES_
         exit 1
     fi
     
-    # Extract frames with MAX_FPS limit and MAX_LEN if specified
-    FFMPEG_CMD=(ffmpeg -i "$INPUT_VIDEO" -vf "fps=fps=${MAX_FPS}")
-    if [ -n "$MAX_LEN" ]; then
-        FFMPEG_CMD+=(-t "$MAX_LEN")
-    fi
+    # Extract frames from rgb.mp4 using reference FPS
+    FFMPEG_CMD=(ffmpeg -i "$REFERENCE_VIDEO" -vf "fps=fps=${REFERENCE_FPS}")
     FFMPEG_CMD+=(-y "${FRAMES_DIR}/frame_%06d.png")
     if ! "${FFMPEG_CMD[@]}" >/dev/null 2>&1; then
-        echo "Error: Failed to extract frames from video" >&2
+        echo "Error: Failed to extract frames from rgb.mp4" >&2
         exit 1
     fi
     
@@ -333,31 +376,8 @@ else
 fi
 
 # Create or update metadata.json (without depth dimensions for now)
-create_metadata "$METADATA_FILE" "$INPUT_VIDEO" "$FRAMES_DIR" false
+create_metadata "$METADATA_FILE" "$REFERENCE_VIDEO" "$FRAMES_DIR" false
 echo "Metadata saved to $METADATA_FILE" | tee -a "$LOG_FILE"
-
-# Step 2: Create rgb.mp4 (reencode with h264, original resolution, actual fps from metadata)
-if [ ! -f "$RGB_VIDEO" ]; then
-    echo "Creating rgb.mp4..." | tee -a "$LOG_FILE"
-    
-    extract_video_metadata "$INPUT_VIDEO"
-    
-    # Use actual_fps from metadata (same as what VDA will use) to ensure sync
-    # Reencode with h264, original resolution, actual fps, and MAX_LEN if specified
-    FFMPEG_CMD=(ffmpeg -i "$INPUT_VIDEO" -vf "fps=fps=${METADATA_ACTUAL_FPS}" -c:v libx264 -pix_fmt yuv420p -crf 18)
-    if [ -n "$MAX_LEN" ]; then
-        FFMPEG_CMD+=(-t "$MAX_LEN")
-    fi
-    FFMPEG_CMD+=(-y "$RGB_VIDEO")
-    if ! "${FFMPEG_CMD[@]}" >/dev/null 2>&1; then
-        echo "Error: Failed to create rgb.mp4" >&2
-        exit 1
-    fi
-    
-    echo "rgb.mp4 created: $RGB_VIDEO" | tee -a "$LOG_FILE"
-else
-    echo "rgb.mp4 already exists, skipping creation" | tee -a "$LOG_FILE"
-fi
 
 # Step 3: Scene detection (if scene_timestamps not in metadata.json or empty)
 if ! python3 -c "import json; data = json.load(open('$METADATA_FILE')); timestamps = data.get('scene_timestamps', []); exit(0 if timestamps and len(timestamps) > 0 else 1)" 2>/dev/null; then
@@ -369,11 +389,9 @@ if ! python3 -c "import json; data = json.load(open('$METADATA_FILE')); timestam
     fi
     
     TEMP_TIMESTAMPS="${ROOT_DIR}/.temp_scene_timestamps.json"
-    SCENE_SPLIT_ARGS=("$INPUT_VIDEO" "-o" "${ROOT_DIR}/scenes_temp")
-    if [ -n "$MAX_LEN" ]; then
-        SCENE_SPLIT_ARGS+=("--max-len" "$MAX_LEN")
-    fi
-    SCENE_SPLIT_ARGS+=("--output-timestamps" "$TEMP_TIMESTAMPS")
+    # Use rgb.mp4 for scene detection to ensure timestamps match
+    # rgb.mp4 already has MAX_LEN applied, so don't pass it again
+    SCENE_SPLIT_ARGS=("$REFERENCE_VIDEO" "-o" "${ROOT_DIR}/scenes_temp" "--output-timestamps" "$TEMP_TIMESTAMPS")
     
     if ! micromamba run -n da3 python "$SCENE_SPLIT_SCRIPT" "${SCENE_SPLIT_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
         echo "Error: Failed to detect scenes" >&2
@@ -442,10 +460,10 @@ else
     echo "Scene timestamps already in metadata.json, skipping scene detection" | tee -a "$LOG_FILE"
 fi
 
-# Step 4: Outpainting (placeholder for now)
+# Step 5: Outpainting (placeholder for now)
 echo "Outpainting step (placeholder - not implemented yet)" | tee -a "$LOG_FILE"
 
-# Step 5: Run VDA depth estimation (unless --no-depth)
+# Step 6: Run VDA depth estimation (unless --no-depth)
 if [ "$NO_DEPTH" = false ]; then
     if [ ! -f "$DEPTH_VIDEO" ]; then
         echo "Running VDA depth estimation..." | tee -a "$LOG_FILE"
@@ -472,13 +490,39 @@ if [ "$NO_DEPTH" = false ]; then
         mkdir -p "$HF_HOME" "$TORCH_HOME"
         
         # Run VDA - it will use metadata.json to get fps and scene_timestamps for scene-aware normalization
-        python "$VDA_PYTHON_SCRIPT" \
-            --input "$RGB_VIDEO" \
-            --output "$DEPTH_VIDEO" \
-            --encoder vitl \
-            --input_size 518 \
-            --max_res "$MAX_RES" \
-            --metadata-json "$METADATA_FILE" 2>&1 | tee -a "$LOG_FILE"
+        # Pass reference FPS to ensure exact timing match
+        VDA_ARGS=(
+            --input "$REFERENCE_VIDEO"
+            --output "$DEPTH_VIDEO"
+            --encoder vitl
+            --input_size 518
+            --max_res "$MAX_RES"
+            --metadata-json "$METADATA_FILE"
+            --target-fps "$REFERENCE_FPS"
+        )
+        if [ "$SAVE_NPZ" = true ]; then
+            VDA_ARGS+=(--save-npz)
+        fi
+        python "$VDA_PYTHON_SCRIPT" "${VDA_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
+        
+        # Re-encode depth video to match rgb.mp4 exactly (same fps, duration, frame count)
+        echo "Re-encoding depth video to match rgb.mp4 timing exactly..." | tee -a "$LOG_FILE"
+        TEMP_DEPTH="${DEPTH_VIDEO}.tmp"
+        mv "$DEPTH_VIDEO" "$TEMP_DEPTH"
+        
+        # Re-encode with exact rgb.mp4 FPS and ensure frame count matches
+        FFMPEG_CMD=(ffmpeg -i "$TEMP_DEPTH" -vf "fps=fps=${REFERENCE_FPS}" -c:v libx264 -pix_fmt yuv420p -crf 18)
+        if [ -n "$REFERENCE_DURATION" ]; then
+            FFMPEG_CMD+=(-t "$REFERENCE_DURATION")
+        fi
+        FFMPEG_CMD+=(-y "$DEPTH_VIDEO")
+        if ! "${FFMPEG_CMD[@]}" >/dev/null 2>&1; then
+            echo "Error: Failed to re-encode depth video" >&2
+            mv "$TEMP_DEPTH" "$DEPTH_VIDEO"
+            exit 1
+        fi
+        rm -f "$TEMP_DEPTH"
+        echo "Depth video re-encoded to match rgb.mp4 timing" | tee -a "$LOG_FILE"
         
         echo "Depth video created: $DEPTH_VIDEO" | tee -a "$LOG_FILE"
         
@@ -504,7 +548,7 @@ if [ "$NO_DEPTH" = false ]; then
         # Update metadata with depth dimensions and scene information if not already present
         SCENE_DEPTH_STATS_FILE="${ROOT_DIR}/.scene_depth_stats.json"
         if ! python3 -c "import json; data = json.load(open('$METADATA_FILE')); exit(0 if 'depth_width' in data and 'scene_timestamps' in data else 1)" 2>/dev/null; then
-            update_metadata_with_scenes "$METADATA_FILE" "$INPUT_VIDEO" "$FRAMES_DIR" "$SCENE_DEPTH_STATS_FILE"
+            update_metadata_with_scenes "$METADATA_FILE" "$REFERENCE_VIDEO" "$FRAMES_DIR" "$SCENE_DEPTH_STATS_FILE"
             echo "Metadata updated with depth dimensions and scene information" | tee -a "$LOG_FILE"
             
             # Clean up temporary scene depth stats file
@@ -531,8 +575,8 @@ if [ "$NO_EXPORT" = false ]; then
             exit 1
         fi
         
-        if [ ! -f "$RGB_VIDEO" ]; then
-            echo "Error: RGB video not found: $RGB_VIDEO" >&2
+        if [ ! -f "$REFERENCE_VIDEO" ]; then
+            echo "Error: rgb.mp4 not found: $REFERENCE_VIDEO" >&2
             exit 1
         fi
         
@@ -549,7 +593,7 @@ import os
 output_dir = "$ROOT_DIR"
 export_zip = "$EXPORT_ZIP"
 depth_video = "$DEPTH_VIDEO"
-rgb_video = "$RGB_VIDEO"
+rgb_video = "$REFERENCE_VIDEO"
 metadata_file = "$METADATA_FILE"
 
 with zipfile.ZipFile(export_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
