@@ -321,7 +321,8 @@ if [ ! -f "$REFERENCE_VIDEO" ]; then
     # Re-encode input video to actual_fps (min of original and MAX_FPS) if needed
     # This ensures consistent timing for all downstream processing
     # Keep original resolution, use h264, and apply MAX_LEN if specified
-    FFMPEG_CMD=(ffmpeg -i "$INPUT_VIDEO" -vf "fps=fps=${METADATA_ACTUAL_FPS}" -c:v libx264 -pix_fmt yuv420p -crf 18)
+    # Downmix audio to 2 channels (stereo)
+    FFMPEG_CMD=(ffmpeg -i "$INPUT_VIDEO" -vf "fps=fps=${METADATA_ACTUAL_FPS}" -c:v libx264 -pix_fmt yuv420p -crf 18 -ac 2 -c:a aac)
     if [ -n "$MAX_LEN" ]; then
         FFMPEG_CMD+=(-t "$MAX_LEN")
     fi
