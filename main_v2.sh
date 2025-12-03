@@ -180,89 +180,53 @@ round_to_multiple() {
 }
 
 # Function to calculate optimal crop and depth dimensions
-# Finds the smallest crop from width such that depth height is closest to multiple of 14
+# Calculates dimensions to maintain exact aspect ratio between RGB and depth
 # Returns: RGB_CROP_X (pixels to crop from width), RGB_WIDTH, RGB_HEIGHT, DEPTH_WIDTH, DEPTH_HEIGHT
 calculate_crop_and_depth_dimensions() {
     local orig_width=$1
     local orig_height=$2
     local max_res=$3
     
-    # We'll resize width to max_res, so depth_width = max_res
-    local depth_width=$max_res
+    # Depth width is constrained to max_res
+    DEPTH_WIDTH=$max_res
     
-    # Find optimal crop x such that: depth_width / (orig_width - x) * orig_height -> closest to multiple of 14
-    local best_x=0
-    local best_diff=999999
-    local best_depth_height=0
+    # Calculate ideal depth height to match original aspect ratio
+    # depth_height = depth_width / (orig_width / orig_height)
+    local ideal_depth_height=$(echo "$DEPTH_WIDTH $orig_width $orig_height" | awk '{printf "%.2f", ($1 * $3) / $2}')
     
-    # Try cropping from 0 to a reasonable maximum (e.g., 50 pixels)
-    local max_crop=50
-    for x in $(seq 0 $max_crop); do
-        local cropped_width=$((orig_width - x))
-        if [ "$cropped_width" -le 0 ]; then
-            continue
-        fi
-        
-        # Calculate depth height: depth_width / cropped_width * orig_height
-        local depth_height=$(echo "$depth_width $cropped_width $orig_height" | awk '{printf "%.0f", ($1 / $2) * $3}')
-        
-        # Find nearest multiple of 14
-        local rounded_height=$(( (depth_height / 14) * 14 ))
-        local next_multiple=$((rounded_height + 14))
-        
-        # Check which is closer
-        local diff1=$((depth_height - rounded_height))
-        local diff2=$((next_multiple - depth_height))
-        
-        if [ "$diff2" -lt "$diff1" ]; then
-            rounded_height=$next_multiple
-            diff1=$diff2
-        fi
-        
-        # Use absolute difference
-        if [ "$diff1" -lt 0 ]; then
-            diff1=$((0 - diff1))
-        fi
-        
-        # Check if this is better
-        if [ "$diff1" -lt "$best_diff" ]; then
-            best_x=$x
-            best_diff=$diff1
-            best_depth_height=$rounded_height
-        fi
-        
-        # Early exit if we found perfect match
-        if [ "$diff1" -eq 0 ]; then
-            break
-        fi
-    done
+    # Round to nearest even number (required for yuv420p encoding)
+    DEPTH_HEIGHT=$(echo "$ideal_depth_height" | awk '{h = int($1 + 0.5); if (h % 2 == 1) h = h + 1; print h}')
     
-    # Calculate final dimensions
-    RGB_CROP_X=$best_x
-    RGB_WIDTH=$((orig_width - RGB_CROP_X))
-    RGB_HEIGHT=$orig_height  # Height stays the same
-    DEPTH_WIDTH=$depth_width
-    DEPTH_HEIGHT=$best_depth_height
+    echo "  Calculated depth dimensions: ${DEPTH_WIDTH}x${DEPTH_HEIGHT} (from ideal height: ${ideal_depth_height})" >&2
     
-    # Depth dimensions are already multiples of 14 from the calculation above
-    # Since 14 is even, multiples of 14 are automatically even - no need to check evenness
-    # Just verify they're multiples of 14 (safety check)
-    if [ $((DEPTH_WIDTH % 14)) -ne 0 ] || [ $((DEPTH_HEIGHT % 14)) -ne 0 ]; then
-        echo "Error: Depth dimensions are not multiples of 14: ${DEPTH_WIDTH}x${DEPTH_HEIGHT}" >&2
-        # Round down to nearest multiple of 14
-        DEPTH_WIDTH=$(( (DEPTH_WIDTH / 14) * 14 ))
-        DEPTH_HEIGHT=$(( (DEPTH_HEIGHT / 14) * 14 ))
-        echo "  Adjusted to: ${DEPTH_WIDTH}x${DEPTH_HEIGHT}" >&2
-    fi
+    # Now calculate RGB crop to match depth's actual aspect ratio exactly
+    # rgb_aspect = depth_aspect = DEPTH_WIDTH / DEPTH_HEIGHT
+    # rgb_width = rgb_height * depth_aspect
+    local depth_aspect=$(echo "$DEPTH_WIDTH $DEPTH_HEIGHT" | awk '{printf "%.10f", $1 / $2}')
+    local ideal_rgb_width=$(echo "$orig_height $depth_aspect" | awk '{printf "%.2f", $1 * $2}')
+    
+    # Round to nearest even number
+    RGB_WIDTH=$(echo "$ideal_rgb_width" | awk '{w = int($1 + 0.5); if (w % 2 == 1) w = w + 1; print w}')
+    RGB_HEIGHT=$orig_height
     
     # Ensure RGB dimensions are even (required by some codecs)
     # RGB doesn't need to be multiple of 14, just even
     RGB_WIDTH=$((RGB_WIDTH - (RGB_WIDTH % 2)))
     RGB_HEIGHT=$((RGB_HEIGHT - (RGB_HEIGHT % 2)))
     
+    # Calculate total crop amount needed: orig_width - RGB_WIDTH
+    RGB_CROP_X=$((orig_width - RGB_WIDTH))
+    # Calculate crop from left and right (split evenly, with remainder on left if odd)
+    RGB_CROP_LEFT=$((RGB_CROP_X / 2 + RGB_CROP_X % 2))
+    RGB_CROP_RIGHT=$((RGB_CROP_X / 2))
+    
+    echo "  Calculated RGB dimensions: ${RGB_WIDTH}x${RGB_HEIGHT} (from ideal width: ${ideal_rgb_width})" >&2
+    echo "  Crop: ${RGB_CROP_X}px total (${RGB_CROP_LEFT}px left, ${RGB_CROP_RIGHT}px right)" >&2
+    echo "  RGB aspect: $(echo "$RGB_WIDTH $RGB_HEIGHT" | awk '{printf "%.10f", $1/$2}'), Depth aspect: ${depth_aspect}" >&2
+    
     echo "Calculated crop and dimensions:" >&2
     echo "  Original: ${orig_width}x${orig_height}" >&2
-    echo "  Crop: ${RGB_CROP_X}px from width" >&2
+    echo "  Crop: ${RGB_CROP_X}px total (${RGB_CROP_LEFT}px left, ${RGB_CROP_RIGHT}px right)" >&2
     echo "  RGB: ${RGB_WIDTH}x${RGB_HEIGHT}" >&2
     echo "  Depth: ${DEPTH_WIDTH}x${DEPTH_HEIGHT}" >&2
 }
@@ -292,9 +256,12 @@ create_depth_input_video() {
     # Crop and resize in one step
     # crop=width:height:x:y crops from position (x,y) with size width x height
     # Then scale to depth dimensions
+    # Remove audio (-an) since this is only for depth processing
     ffmpeg -i "$input_video" \
         -vf "crop=${orig_width}-${crop_x}:${orig_height}:${crop_left}:0,scale=${depth_width}:${depth_height}" \
-        -c:v libx264 -pix_fmt yuv420p -crf 18 -y "$output_video" >/dev/null 2>&1
+        -c:v libx264 -pix_fmt yuv420p -crf 18 \
+        -an \
+        -y "$output_video" >/dev/null 2>&1
     
     if [ $? -ne 0 ]; then
         echo "Error: Failed to create depth input video" >&2
@@ -312,34 +279,38 @@ create_depth_input_video() {
     return 0
 }
 
-# Function to crop RGB video (remove RGB_CROP_X pixels from width)
+# Function to crop RGB video to target width
 create_rgb_video() {
     local input_video="$1"
     local output_video="$2"
-    local crop_x=$3
+    local target_width=$3
     
     extract_video_metadata "$input_video"
     local orig_width=$METADATA_WIDTH
     local orig_height=$METADATA_HEIGHT
     
-    # Calculate crop: split evenly left/right, or 1 more on left if odd
-    local crop_left=$((crop_x / 2 + crop_x % 2))
-    local crop_right=$((crop_x / 2))
-    
-    if [ "$crop_x" -eq 0 ]; then
+    if [ "$orig_width" -eq "$target_width" ]; then
         echo "No crop needed, copying input video" | tee -a "$LOG_FILE"
         cp "$input_video" "$output_video"
         return 0
     fi
     
+    # Calculate crop: split evenly left/right, with remainder on left if odd
+    local crop_total=$((orig_width - target_width))
+    local crop_left=$((crop_total / 2 + crop_total % 2))
+    local crop_right=$((crop_total / 2))
+    
     echo "Creating RGB video:" | tee -a "$LOG_FILE"
     echo "  Original: ${orig_width}x${orig_height}" | tee -a "$LOG_FILE"
-    echo "  Cropping: ${crop_left}px left, ${crop_right}px right (total ${crop_x}px)" | tee -a "$LOG_FILE"
+    echo "  Target: ${target_width}x${orig_height}" | tee -a "$LOG_FILE"
+    echo "  Cropping: ${crop_left}px left, ${crop_right}px right (total ${crop_total}px)" | tee -a "$LOG_FILE"
     
-    # Crop from width only
+    # Crop from width only, copy audio as-is (will be downmixed later in rgb.mp4)
     ffmpeg -i "$input_video" \
-        -vf "crop=${orig_width}-${crop_x}:${orig_height}:${crop_left}:0" \
-        -c:v libx264 -pix_fmt yuv420p -crf 18 -y "$output_video" >/dev/null 2>&1
+        -vf "crop=${target_width}:${orig_height}:${crop_left}:0" \
+        -c:v libx264 -pix_fmt yuv420p -crf 18 \
+        -c:a copy \
+        -y "$output_video" >/dev/null 2>&1
     
     if [ $? -ne 0 ]; then
         echo "Error: Failed to create RGB video" >&2
@@ -372,40 +343,50 @@ verify_videos_match() {
     local height1=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$video1")
     local height2=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$video2")
     
-    # Extract PTS information (first and last frame PTS)
-    local pts1_start=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts_time -of csv=p=0 "$video1" 2>/dev/null | head -n1 || echo "")
-    local pts1_end=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts_time -of csv=p=0 "$video1" 2>/dev/null | tail -n1 || echo "")
-    local pts2_start=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts_time -of csv=p=0 "$video2" 2>/dev/null | head -n1 || echo "")
-    local pts2_end=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts_time -of csv=p=0 "$video2" 2>/dev/null | tail -n1 || echo "")
+    # Extract timebase - CRITICAL for PTS comparison
+    local timebase1=$(ffprobe -v error -select_streams v:0 -show_entries stream=time_base -of default=noprint_wrappers=1:nokey=1 "$video1")
+    local timebase2=$(ffprobe -v error -select_streams v:0 -show_entries stream=time_base -of default=noprint_wrappers=1:nokey=1 "$video2")
+    
+    # Extract PTS information (first and last frame PTS) - use integer PTS, not floating-point time
+    # pkt_pts is in timebase units (integer), pkt_pts_time is in seconds (floating-point with precision loss)
+    local pts1_start=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts -of csv=p=0 "$video1" 2>/dev/null | head -n1 || echo "")
+    local pts1_end=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts -of csv=p=0 "$video1" 2>/dev/null | tail -n1 || echo "")
+    local pts2_start=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts -of csv=p=0 "$video2" 2>/dev/null | head -n1 || echo "")
+    local pts2_end=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts -of csv=p=0 "$video2" 2>/dev/null | tail -n1 || echo "")
     
     local mismatch=false
     local critical_mismatch=false
     
-    # Check aspect ratio (must match exactly, but dimensions can differ)
-    local aspect1=$(echo "$width1 $height1" | awk '{printf "%.6f", $1 / $2}')
-    local aspect2=$(echo "$width2 $height2" | awk '{printf "%.6f", $1 / $2}')
+    # Check aspect ratio (allow small tolerance for integer rounding when scaling to different resolutions)
+    local aspect1=$(echo "$width1 $height1" | awk '{printf "%.10f", $1 / $2}')
+    local aspect2=$(echo "$width2 $height2" | awk '{printf "%.10f", $1 / $2}')
     local aspect_diff=$(echo "$aspect1 $aspect2" | awk '{diff = ($1 > $2) ? ($1 - $2) : ($2 - $1); print diff}')
+    local aspect_diff_pct=$(echo "$aspect_diff $aspect1" | awk '{printf "%.4f", ($1 / $2) * 100}')
     
-    if [ "$(echo "$aspect_diff > 0.0001" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
-        echo "❌ CRITICAL: Aspect ratio mismatch! RGB: ${width1}x${height1} (aspect: $aspect1), Depth: ${width2}x${height2} (aspect: $aspect2)" | tee -a "$LOG_FILE"
+    # Allow 0.02% aspect ratio difference to account for integer dimension rounding
+    # For aspect ~2.35, this is ~0.0005 absolute difference
+    if [ "$(echo "$aspect_diff_pct > 0.02" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+        echo "❌ CRITICAL: Aspect ratio differs by ${aspect_diff_pct}%! RGB: ${width1}x${height1} (aspect: $aspect1), Depth: ${width2}x${height2} (aspect: $aspect2)" | tee -a "$LOG_FILE"
         critical_mismatch=true
         mismatch=true
     else
         # Log resolution difference (expected: RGB higher than depth)
         if [ "$width1" != "$width2" ] || [ "$height1" != "$height2" ]; then
-            echo "ℹ️  Resolution difference (expected): RGB: ${width1}x${height1}, Depth: ${width2}x${height2} (same aspect ratio: $aspect1)" | tee -a "$LOG_FILE"
+            echo "ℹ️  Resolution difference (expected): RGB: ${width1}x${height1}, Depth: ${width2}x${height2} (aspect: RGB=$aspect1, Depth=$aspect2, diff=${aspect_diff_pct}%)" | tee -a "$LOG_FILE"
         fi
     fi
     
-    # Check frame count (must match exactly)
-    if [ -n "$frames1" ] && [ -n "$frames2" ]; then
-        if [ "$frames1" != "$frames2" ]; then
-            echo "❌ CRITICAL: Frame count mismatch! RGB: $frames1, Depth: $frames2" | tee -a "$LOG_FILE"
-            critical_mismatch=true
-            mismatch=true
-        fi
-    elif [ -z "$frames1" ] || [ -z "$frames2" ]; then
-        echo "⚠️  WARNING: Could not determine frame count for one or both videos" | tee -a "$LOG_FILE"
+    # Check frame count (must match exactly) - CRITICAL validation
+    if [ -z "$frames1" ] || [ -z "$frames2" ]; then
+        echo "❌ CRITICAL: Could not determine frame count for one or both videos!" | tee -a "$LOG_FILE"
+        echo "   RGB frames: ${frames1:-UNKNOWN}" | tee -a "$LOG_FILE"
+        echo "   Depth frames: ${frames2:-UNKNOWN}" | tee -a "$LOG_FILE"
+        critical_mismatch=true
+        mismatch=true
+    elif [ "$frames1" != "$frames2" ]; then
+        echo "❌ CRITICAL: Frame count mismatch! RGB: $frames1, Depth: $frames2" | tee -a "$LOG_FILE"
+        critical_mismatch=true
+        mismatch=true
     fi
     
     # Check FPS (must match exactly, tolerance 0.001)
@@ -416,32 +397,50 @@ verify_videos_match() {
         mismatch=true
     fi
     
-    # Check duration (must match exactly, tolerance 0.01s)
+    # Check duration - should be calculated from PTS: (last_pts - first_pts) × timebase
+    # If PTS and timebase match, duration SHOULD match, but container metadata can have quirks
+    # Treat significant differences as warnings, not critical errors (PTS is ground truth)
     local dur_diff=$(echo "$duration1 $duration2" | awk '{diff = ($1 > $2) ? ($1 - $2) : ($2 - $1); print diff}')
-    if [ "$(echo "$dur_diff > 0.01" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
-        echo "❌ CRITICAL: Duration mismatch! RGB: ${duration1}s, Depth: ${duration2}s (diff: ${dur_diff}s)" | tee -a "$LOG_FILE"
+    
+    if [ "$(echo "$dur_diff > 0.001" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+        echo "⚠️  WARNING: Duration metadata differs by ${dur_diff}s (RGB: ${duration1}s, Depth: ${duration2}s)" | tee -a "$LOG_FILE"
+        echo "   If PTS values match (verified below), videos are synchronized despite duration difference" | tee -a "$LOG_FILE"
+        echo "   Duration difference may be due to container metadata encoding differences" | tee -a "$LOG_FILE"
+    fi
+    
+    # Check timebase FIRST - PTS comparison is meaningless if timebases differ!
+    if [ -z "$timebase1" ] || [ -z "$timebase2" ]; then
+        echo "❌ CRITICAL: Could not extract timebase information!" | tee -a "$LOG_FILE"
+        echo "   RGB timebase: ${timebase1:-UNKNOWN}" | tee -a "$LOG_FILE"
+        echo "   Depth timebase: ${timebase2:-UNKNOWN}" | tee -a "$LOG_FILE"
+        critical_mismatch=true
+        mismatch=true
+    elif [ "$timebase1" != "$timebase2" ]; then
+        echo "❌ CRITICAL: Timebase mismatch! RGB: $timebase1, Depth: $timebase2" | tee -a "$LOG_FILE"
+        echo "   PTS values cannot be compared with different timebases!" | tee -a "$LOG_FILE"
         critical_mismatch=true
         mismatch=true
     fi
     
-    # Check PTS (presentation timestamps) - must match EXACTLY with ZERO tolerance
+    # Check PTS (presentation timestamps) - use integer PTS values for exact comparison
+    # Only meaningful if timebases match!
     if [ -n "$pts1_start" ] && [ -n "$pts2_start" ] && [ -n "$pts1_end" ] && [ -n "$pts2_end" ]; then
-        # Compare PTS values exactly (no tolerance)
+        # Integer PTS values must match EXACTLY (no tolerance needed)
         if [ "$pts1_start" != "$pts2_start" ]; then
-            echo "❌ CRITICAL: PTS start mismatch! RGB: $pts1_start, Depth: $pts2_start" | tee -a "$LOG_FILE"
+            echo "❌ CRITICAL: PTS start mismatch! RGB: $pts1_start, Depth: $pts2_start (timebase: $timebase1)" | tee -a "$LOG_FILE"
             critical_mismatch=true
             mismatch=true
         fi
         
         if [ "$pts1_end" != "$pts2_end" ]; then
-            echo "❌ CRITICAL: PTS end mismatch! RGB: $pts1_end, Depth: $pts2_end" | tee -a "$LOG_FILE"
+            echo "❌ CRITICAL: PTS end mismatch! RGB: $pts1_end, Depth: $pts2_end (timebase: $timebase1)" | tee -a "$LOG_FILE"
             critical_mismatch=true
             mismatch=true
         fi
         
-        # Also check all PTS values match frame-by-frame
-        local pts1_all=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts_time -of csv=p=0 "$video1" 2>/dev/null | tr '\n' ' ')
-        local pts2_all=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts_time -of csv=p=0 "$video2" 2>/dev/null | tr '\n' ' ')
+        # Check all integer PTS values match frame-by-frame
+        local pts1_all=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts -of csv=p=0 "$video1" 2>/dev/null | tr '\n' ' ')
+        local pts2_all=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts -of csv=p=0 "$video2" 2>/dev/null | tr '\n' ' ')
         
         if [ -n "$pts1_all" ] && [ -n "$pts2_all" ]; then
             if [ "$pts1_all" != "$pts2_all" ]; then
@@ -470,8 +469,9 @@ verify_videos_match() {
         echo "   FPS: $fps1" | tee -a "$LOG_FILE"
         echo "   Duration: ${duration1}s" | tee -a "$LOG_FILE"
         echo "   Frames: ${frames1:-N/A}" | tee -a "$LOG_FILE"
+        echo "   Timebase: ${timebase1}" | tee -a "$LOG_FILE"
         if [ -n "$pts1_start" ] && [ -n "$pts1_end" ]; then
-            echo "   PTS: ${pts1_start}s - ${pts1_end}s" | tee -a "$LOG_FILE"
+            echo "   Integer PTS range: ${pts1_start} - ${pts1_end}" | tee -a "$LOG_FILE"
         fi
         return 0
     fi
@@ -495,14 +495,11 @@ try:
     data = np.load("$depth_npz")
     if 'depth' in data:
         depth = data['depth']
-        # Filter out invalid depths
-        valid_depths = depth[depth > 0]
-        if len(valid_depths) > 0:
-            min_depth = float(np.min(valid_depths))
-            max_depth = float(np.max(valid_depths))
-            print(f"{min_depth} {max_depth}")
-        else:
-            print("0.0 10.0")
+        # Use all metric depth values (no filtering)
+        # These are the actual metric depth values from the model
+        min_depth = float(np.min(depth))
+        max_depth = float(np.max(depth))
+        print(f"{min_depth} {max_depth}")
     else:
         print("0.0 10.0")
 except Exception as e:
@@ -566,7 +563,7 @@ echo "" | tee -a "$LOG_FILE"
 RGB_CROPPED_VIDEO="${ROOT_DIR}/.rgb_cropped.mp4"
 if [ "$IS_NEW_RUN" = true ] || [ ! -f "$RGB_CROPPED_VIDEO" ]; then
     echo "Creating RGB video (cropped)..." | tee -a "$LOG_FILE"
-    if ! create_rgb_video "$INPUT_VIDEO" "$RGB_CROPPED_VIDEO" "$RGB_CROP_X"; then
+    if ! create_rgb_video "$INPUT_VIDEO" "$RGB_CROPPED_VIDEO" "$RGB_WIDTH"; then
         echo "Error: Failed to create RGB video" >&2
         exit 1
     fi
@@ -663,8 +660,13 @@ if [ ! -f "$RGB_VIDEO" ]; then
     # Get FPS from cropped RGB video
     extract_video_metadata "$RGB_CROPPED_VIDEO"
     
-    # Simply reencode to match target FPS (dimensions already correct from cropping)
-    ffmpeg -i "$RGB_CROPPED_VIDEO" -vf "fps=fps=${METADATA_ACTUAL_FPS}" -c:v libx264 -pix_fmt yuv420p -crf 18 -y "$RGB_VIDEO" >/dev/null 2>&1
+    # Reencode to match target FPS with audio downmixed to stereo (2 channels)
+    # -ac 2 downmixes audio to stereo regardless of source channel count
+    ffmpeg -i "$RGB_CROPPED_VIDEO" \
+        -vf "fps=fps=${METADATA_ACTUAL_FPS}" \
+        -c:v libx264 -pix_fmt yuv420p -crf 18 \
+        -c:a aac -ac 2 -b:a 192k \
+        -y "$RGB_VIDEO" >/dev/null 2>&1
     
     if [ $? -ne 0 ]; then
         echo "Error: Failed to create rgb.mp4" >&2
@@ -796,9 +798,9 @@ EOF
                 scene_fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 "$scene_file" | awk -F'/' '{if ($2+0 == 0) print 0; else print ($1+0)/($2+0)}')
                 actual_scene_fps=$(echo "$scene_fps $MAX_FPS" | awk '{if ($1 < $2) print $1; else print $2}')
                 
-                # Process with da3 - export both mini_npz (for stats) and depth_vis (for video)
-                echo "  → Starting da3 depth estimation (live inference)..." | tee -a "$LOG_FILE"
-                echo "    Input: $scene_file" | tee -a "$LOG_FILE"
+                # Process with da3 frame-by-frame to ensure exact frame count matching
+                echo "  → Starting da3 depth estimation (frame-by-frame)..." | tee -a "$LOG_FILE"
+                echo "    Input: $scene_file (extracting frames first)" | tee -a "$LOG_FILE"
                 echo "    FPS: $actual_scene_fps, Resolution: ${MAX_RES}px (max)" | tee -a "$LOG_FILE"
                 if [ "$USE_BACKEND" = true ]; then
                     echo "    Using backend: $BACKEND_URL" | tee -a "$LOG_FILE"
@@ -806,26 +808,68 @@ EOF
                     echo "    Using live inference (direct model loading)" | tee -a "$LOG_FILE"
                 fi
                 
-                DA3_ARGS=(
-                    "video" "$scene_file"
-                    "--model-dir" "$DA3_MODEL_DIR"
-                    "--export-dir" "$scene_dir"
-                    "--export-format" "mini_npz"
-                    "--process-res" "$MAX_RES"
-                    "--fps" "$actual_scene_fps"
-                    "--auto-cleanup"
-                )
+                # Get RGB scene video properties FIRST (before processing)
+                scene_rgb_fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 "$scene_file" | awk -F'/' '{if ($2+0 == 0) print 0; else print ($1+0)/($2+0)}')
+                scene_rgb_duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$scene_file")
+                scene_rgb_width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$scene_file")
+                scene_rgb_height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$scene_file")
+                scene_rgb_frames=$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_frames -of default=noprint_wrappers=1:nokey=1 "$scene_file" 2>/dev/null || echo "")
                 
-                if [ "$USE_BACKEND" = true ]; then
-                    DA3_ARGS+=("--use-backend" "--backend-url" "$BACKEND_URL")
-                fi
+                # Extract integer PTS timestamps and timebase from RGB scene video
+                echo "  → Extracting PTS timestamps from RGB scene video..." | tee -a "$LOG_FILE"
+                scene_rgb_pts_file="${scene_dir}/rgb_pts.npy"
+                scene_rgb_timebase_file="${scene_dir}/rgb_timebase.txt"
+                python3 <<EOF
+import subprocess
+import numpy as np
+from pathlib import Path
+
+scene_file = "$scene_file"
+pts_file = "$scene_rgb_pts_file"
+timebase_file = "$scene_rgb_timebase_file"
+
+# Extract integer PTS timestamps (no precision loss)
+pts_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+           '-show_entries', 'frame=pkt_pts', '-of', 'csv=p=0', scene_file]
+pts_result = subprocess.run(pts_cmd, capture_output=True, text=True, check=True)
+pts_values = [int(x.strip()) for x in pts_result.stdout.strip().split('\n') if x.strip()]
+
+# Extract timebase for this stream
+tb_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+          '-show_entries', 'stream=time_base', '-of', 'csv=p=0', scene_file]
+tb_result = subprocess.run(tb_cmd, capture_output=True, text=True, check=True)
+timebase = tb_result.stdout.strip()
+
+# Save integer PTS values
+np.save(pts_file, np.array(pts_values, dtype=np.int64))
+
+# Save timebase
+with open(timebase_file, 'w') as f:
+    f.write(timebase)
+
+print(f"Extracted {len(pts_values)} integer PTS timestamps (timebase: {timebase})")
+EOF
                 
+                # Process frames frame-by-frame using Python script
+                PROCESS_FRAMES_SCRIPT="${SCRIPT_DIR}/process_scene_frames_da3.py"
                 DA3_START_TIME=$(date +%s)
                 
                 # Capture da3 output to check for OOM errors
                 DA3_OUTPUT=$(mktemp)
                 DA3_EXIT_CODE=0
-                micromamba run -n da3 da3 "${DA3_ARGS[@]}" 2>&1 | tee "$DA3_OUTPUT" | tee -a "$LOG_FILE" || DA3_EXIT_CODE=${PIPESTATUS[0]}
+                
+                PROCESS_ARGS=(
+                    "--scene-video" "$scene_file"
+                    "--model-dir" "$DA3_MODEL_DIR"
+                    "--process-res" "$MAX_RES"
+                    "--output-npz" "${scene_dir}/depth_results.npz"
+                )
+                
+                if [ "$USE_BACKEND" = true ]; then
+                    PROCESS_ARGS+=("--use-backend" "--backend-url" "$BACKEND_URL")
+                fi
+                
+                micromamba run -n da3 python "$PROCESS_FRAMES_SCRIPT" "${PROCESS_ARGS[@]}" 2>&1 | tee "$DA3_OUTPUT" | tee -a "$LOG_FILE" || DA3_EXIT_CODE=${PIPESTATUS[0]}
                 
                 # Check for OOM errors in output
                 OOM_DETECTED=false
@@ -834,6 +878,12 @@ EOF
                 fi
                 
                 rm "$DA3_OUTPUT"
+                
+                # Move npz to expected location for compatibility
+                if [ -f "${scene_dir}/depth_results.npz" ]; then
+                    mkdir -p "${scene_dir}/exports/mini_npz"
+                    mv "${scene_dir}/depth_results.npz" "${scene_dir}/exports/mini_npz/results.npz"
+                fi
                 
                 if [ "$DA3_EXIT_CODE" -ne 0 ] || [ "$OOM_DETECTED" = true ]; then
                     if [ "$OOM_DETECTED" = true ]; then
@@ -880,38 +930,57 @@ EOF
                     DA3_DURATION=$((DA3_END_TIME - DA3_START_TIME))
                     echo "  ✅ da3 processing completed in ${DA3_DURATION}s" | tee -a "$LOG_FILE"
                     
-                    # Create depth video from numpy files using scene metadata
-                    echo "  → Creating depth video from numpy data..." | tee -a "$LOG_FILE"
+                    # Create depth video from numpy files using RGB PTS timestamps
+                    echo "  → Creating depth video from numpy data with RGB PTS timestamps..." | tee -a "$LOG_FILE"
                     
-                    # Get scene duration and fps from the scene video file
-                    scene_duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$scene_file")
-                    scene_width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$scene_file")
-                    scene_height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$scene_file")
+                    # Calculate exact target frame count from RGB scene
+                    if [ -n "$scene_rgb_frames" ]; then
+                        target_frames=$scene_rgb_frames
+                    else
+                        # Fallback: calculate from duration and fps
+                        target_frames=$(echo "$scene_rgb_duration $scene_rgb_fps" | awk '{printf "%.0f", $1 * $2}')
+                    fi
                     
                     python3 <<EOF
 import numpy as np
-import cv2
+import subprocess
 from pathlib import Path
 import sys
 
 scene_dir = Path("$scene_dir")
 depth_npz = scene_dir / "exports" / "mini_npz" / "results.npz"
+rgb_pts_file = scene_dir / "rgb_pts.npy"
 depth_video = "$scene_depth_video"
-fps = $actual_scene_fps
-target_duration = $scene_duration
-target_width = $scene_width
-target_height = $scene_height
+fps = $scene_rgb_fps
+target_frames = $target_frames
+target_width = $scene_rgb_width
+target_height = $scene_rgb_height
 
 if not depth_npz.exists():
     print(f"Error: npz file not found at {depth_npz}", file=sys.stderr)
     sys.exit(1)
 
+if not rgb_pts_file.exists():
+    print(f"Error: RGB PTS file not found at {rgb_pts_file}", file=sys.stderr)
+    sys.exit(1)
+
+# Load depth data
 data = np.load(depth_npz)
 if 'depth' not in data:
     print("Error: No depth data in npz file", file=sys.stderr)
     sys.exit(1)
 
 depth = data['depth']
+
+# Load RGB integer PTS timestamps
+rgb_pts = np.load(rgb_pts_file)
+
+# Load RGB timebase
+rgb_timebase_file = scene_dir / "rgb_timebase.txt"
+if rgb_timebase_file.exists():
+    with open(rgb_timebase_file, 'r') as f:
+        rgb_timebase = f.read().strip()
+    print(f"RGB timebase: {rgb_timebase}")
 
 # Normalize depth to 0-255
 depth_min = np.min(depth[depth > 0]) if np.any(depth > 0) else 0
@@ -921,94 +990,150 @@ if depth_max <= depth_min:
 depth_normalized = ((depth - depth_min) / (depth_max - depth_min) * 255).astype(np.uint8)
 
 # Handle different depth array shapes
-final_frame_count = 0
 if depth_normalized.ndim == 2:
-    # Single frame - repeat to match duration
+    # Single frame - repeat to match target frame count
     height, width = depth_normalized.shape
-    num_frames = int(np.ceil(target_duration * fps))
-    final_frame_count = num_frames
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(depth_video, fourcc, fps, (width, height), False)
-    for _ in range(num_frames):
-        out.write(depth_normalized)
-    out.release()
+    depth_normalized = np.repeat(depth_normalized[np.newaxis, ...], target_frames, axis=0)
 elif depth_normalized.ndim == 3:
     # Multiple frames - da3 outputs (frames, height, width) format
     # Check if shape is (height, width, frames) and transpose if needed
-    # If the last dimension is the smallest and much smaller than others, it's likely frames
     if depth_normalized.shape[2] < depth_normalized.shape[0] and depth_normalized.shape[2] < depth_normalized.shape[1]:
         # Shape is likely (height, width, frames) - transpose to (frames, height, width)
         depth_normalized = np.transpose(depth_normalized, (2, 0, 1))
     # Otherwise, assume it's already (frames, height, width) format
     
-    # Now depth_normalized should be (frames, height, width)
     num_frames_depth = depth_normalized.shape[0]
     height, width = depth_normalized.shape[1:3]
     
-    # Calculate target number of frames based on duration and fps
-    target_frames = int(np.ceil(target_duration * fps))
+    # CRITICAL: Validate frame count matches EXACTLY - do not bandage
+    if num_frames_depth != target_frames:
+        print(f"❌ CRITICAL ERROR: Depth frame count mismatch!", file=sys.stderr)
+        print(f"  RGB frames: {target_frames}", file=sys.stderr)
+        print(f"  Depth frames: {num_frames_depth}", file=sys.stderr)
+        print(f"  This indicates da3 did not process the correct number of frames.", file=sys.stderr)
+        print(f"  DO NOT BANDAGE - Fix the root cause!", file=sys.stderr)
+        sys.exit(1)
     
-    # Verify aspect ratio matches (within tolerance)
-    scene_aspect = target_width / target_height
-    depth_aspect = width / height
-    aspect_diff = abs(scene_aspect - depth_aspect)
-    if aspect_diff > 0.01:
-        print(f"Warning: Aspect ratio mismatch - Scene: {scene_aspect:.3f}, Depth: {depth_aspect:.3f}", file=sys.stderr)
-    
-    # Repeat or interpolate frames to match target duration
-    if num_frames_depth < target_frames:
-        # Repeat frames to match duration
-        frame_indices = np.linspace(0, num_frames_depth - 1, target_frames).astype(int)
-        depth_normalized = depth_normalized[frame_indices]
-    elif num_frames_depth > target_frames:
-        # Sample frames to match duration
-        frame_indices = np.linspace(0, num_frames_depth - 1, target_frames).astype(int)
-        depth_normalized = depth_normalized[frame_indices]
-    
-    # Use original depth resolution (no resizing, preserve aspect ratio)
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(depth_video, fourcc, fps, (width, height), False)
-    final_frame_count = len(depth_normalized)
-    for frame in depth_normalized:
-        out.write(frame)
-    out.release()
+    # Resize to match RGB scene dimensions
+    if width != target_width or height != target_height:
+        import cv2
+        resized_frames = []
+        for frame in depth_normalized:
+            resized = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+            resized_frames.append(resized)
+        depth_normalized = np.array(resized_frames)
+        width, height = target_width, target_height
 else:
-    final_frame_count = int(np.ceil(target_duration * fps))
+    print(f"Error: Unsupported depth array shape: {depth_normalized.shape}", file=sys.stderr)
+    sys.exit(1)
+
+# CRITICAL: Verify exact frame count - fail if mismatch
+if len(depth_normalized) != target_frames:
+    print(f"❌ CRITICAL ERROR: Frame count mismatch after processing!", file=sys.stderr)
+    print(f"  Expected: {target_frames}", file=sys.stderr)
+    print(f"  Got: {len(depth_normalized)}", file=sys.stderr)
+    sys.exit(1)
+
+# CRITICAL: Verify PTS count matches frame count exactly
+if len(rgb_pts) != len(depth_normalized):
+    print(f"❌ CRITICAL ERROR: PTS count mismatch!", file=sys.stderr)
+    print(f"  PTS timestamps: {len(rgb_pts)}", file=sys.stderr)
+    print(f"  Depth frames: {len(depth_normalized)}", file=sys.stderr)
+    sys.exit(1)
+
+# Now depth_normalized is (target_frames, height, width) with exact dimensions
+final_frame_count = len(depth_normalized)
+height, width = depth_normalized.shape[1:3]
+
+# Use ffmpeg to encode depth frames, then remux to match RGB timebase and PTS
+print(f"Encoding depth video with exact frame count matching RGB")
+print(f"  Resolution: {width}x{height}")
+print(f"  FPS: {fps}")
+print(f"  Frames: {final_frame_count}")
+
+# Prepare all frame data as bytes (for piping to ffmpeg)
+frame_bytes = b''.join(frame.tobytes() for frame in depth_normalized)
+
+# Step 1: Encode depth frames to a temporary video
+temp_depth_video = str(depth_video).replace('.mp4', '.tmp.mp4')
+ffmpeg_cmd = [
+    'ffmpeg', '-y',
+    '-f', 'rawvideo',
+    '-vcodec', 'rawvideo',
+    '-s', f'{width}x{height}',
+    '-pix_fmt', 'gray',
+    '-r', str(fps),
+    '-i', '-',  # Read from stdin
+    '-an',  # No audio
+    '-c:v', 'libx264',
+    '-pix_fmt', 'yuv420p',
+    '-crf', '18',
+    '-r', str(fps),
+    '-vsync', 'cfr',
+    str(temp_depth_video)
+]
+
+# IMPORTANT: Don't use text=True when piping binary data
+result = subprocess.run(ffmpeg_cmd, input=frame_bytes, capture_output=True)
+
+if result.returncode != 0:
+    stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+    print(f"Error encoding temp depth video: {stderr_text}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"  Encoded temp depth video")
+
+# Step 2: Remux depth video to match RGB's exact timebase
+# Use RGB video as timing reference to copy its timebase
+rgb_video = "$scene_file"
+print(f"  Remuxing depth video to match RGB timebase...")
+
+# Extract RGB's exact frame rate as a fraction (not decimal)
+rgb_fps_cmd = [
+    'ffprobe', '-v', 'error',
+    '-select_streams', 'v:0',
+    '-show_entries', 'stream=r_frame_rate',
+    '-of', 'csv=p=0',
+    rgb_video
+]
+rgb_fps_result = subprocess.run(rgb_fps_cmd, capture_output=True, text=True, check=True)
+rgb_fps_fraction = rgb_fps_result.stdout.strip()
+print(f"  RGB frame rate fraction: {rgb_fps_fraction}")
+
+# Remux depth video using RGB's frame rate fraction
+# This ensures depth video uses the same timebase as RGB
+remux_cmd = [
+    'ffmpeg', '-y',
+    '-r', rgb_fps_fraction,  # Use exact frame rate fraction from RGB
+    '-i', temp_depth_video,
+    '-c:v', 'copy',
+    '-r', rgb_fps_fraction,  # Output frame rate
+    str(depth_video)
+]
+
+result = subprocess.run(remux_cmd, capture_output=True)
+
+if result.returncode != 0:
+    stderr_text = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+    print(f"Error remuxing depth video: {stderr_text}", file=sys.stderr)
+    # Fallback: just use the temp video
+    import shutil
+    shutil.move(temp_depth_video, str(depth_video))
+else:
+    # Remove temp file
+    import os
+    os.unlink(temp_depth_video)
+    print(f"  Remuxed depth video to match RGB timebase")
 
 print(f"Created depth video: {depth_video}")
-if 'width' in locals() and 'height' in locals():
-    print(f"  Resolution: {width}x{height}")
+print(f"  Resolution: {width}x{height}")
 print(f"  FPS: {fps}")
-print(f"  Duration: {target_duration}s")
 print(f"  Frames: {final_frame_count}")
 EOF
                     
                     if [ ! -f "$scene_depth_video" ]; then
                         echo "  ❌ Error: Failed to create depth video for $scene_name, skipping..." | tee -a "$LOG_FILE"
                         continue
-                    fi
-                    
-                    # Re-encode scene depth video to match scene RGB video exactly (including PTS)
-                    echo "  → Re-encoding depth video to match scene RGB exactly (including PTS)..." | tee -a "$LOG_FILE"
-                    scene_rgb_fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 "$scene_file" | awk -F'/' '{if ($2+0 == 0) print 0; else print ($1+0)/($2+0)}')
-                    scene_rgb_duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$scene_file")
-                    scene_rgb_width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$scene_file")
-                    scene_rgb_height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$scene_file")
-                    
-                    TEMP_SCENE_DEPTH="${scene_depth_video}.tmp"
-                    mv "$scene_depth_video" "$TEMP_SCENE_DEPTH"
-                    # Use constant frame rate and generate PTS to ensure exact matching
-                    FFMPEG_CMD=(ffmpeg -i "$TEMP_SCENE_DEPTH" -vf "fps=fps=${scene_rgb_fps},scale=${scene_rgb_width}:${scene_rgb_height}" -r "${scene_rgb_fps}" -c:v libx264 -pix_fmt yuv420p -crf 18 -vsync cfr -fflags +genpts)
-                    if [ -n "$scene_rgb_duration" ]; then
-                        FFMPEG_CMD+=(-t "$scene_rgb_duration")
-                    fi
-                    FFMPEG_CMD+=(-y "$scene_depth_video")
-                    if ! "${FFMPEG_CMD[@]}" >/dev/null 2>&1; then
-                        echo "  ⚠️  Warning: Failed to re-encode scene depth video, using original" | tee -a "$LOG_FILE"
-                        mv "$TEMP_SCENE_DEPTH" "$scene_depth_video"
-                    else
-                        rm -f "$TEMP_SCENE_DEPTH"
-                        echo "    ✅ Scene depth video re-encoded to match scene RGB" | tee -a "$LOG_FILE"
                     fi
                     
                     # Verify scene depth matches scene RGB
@@ -1025,6 +1150,8 @@ EOF
                     if [ -n "$depth_stats" ]; then
                         SCENE_DEPTH_STATS+=("$scene_num:$depth_stats")
                         echo "    Depth range: $depth_stats" | tee -a "$LOG_FILE"
+                    else
+                        echo "    ⚠️  Warning: Could not extract depth stats for $scene_name" | tee -a "$LOG_FILE"
                     fi
                     echo "  ✅ Completed processing $scene_name" | tee -a "$LOG_FILE"
                 fi
@@ -1086,8 +1213,9 @@ EOF
         if [ -s "$CONCAT_FILE" ]; then
             echo "Concatenating $SCENES_TO_STITCH depth scenes..." | tee -a "$LOG_FILE"
             STITCH_START_TIME=$(date +%s)
-            TEMP_DEPTH="${DEPTH_VIDEO}.tmp"
-            ffmpeg -f concat -safe 0 -i "$CONCAT_FILE" -c:v libx264 -pix_fmt yuv420p -crf 18 -y "$TEMP_DEPTH" >/dev/null 2>&1
+            TEMP_DEPTH="${ROOT_DIR}/depth.tmp.mp4"
+            # Concatenate scenes - copy codec to preserve timing
+            ffmpeg -f concat -safe 0 -i "$CONCAT_FILE" -c:v copy -y "$TEMP_DEPTH" >/dev/null 2>&1
             STITCH_END_TIME=$(date +%s)
             STITCH_DURATION=$((STITCH_END_TIME - STITCH_START_TIME))
             rm "$CONCAT_FILE"
@@ -1110,57 +1238,72 @@ rgb_duration = "$RGB_DURATION"
 depth_width = $DEPTH_WIDTH
 depth_height = $DEPTH_HEIGHT
 
-# Extract PTS from RGB video (frame-by-frame)
-print("Extracting PTS timestamps from RGB video...")
-pts_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', 
-           '-show_entries', 'frame=pkt_pts_time', '-of', 'csv=p=0', rgb_video]
+# Extract RGB video frame count first for validation
+print("Extracting RGB video properties for strict validation...")
+rgb_frames_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', 
+                   '-count_frames', '-show_entries', 'stream=nb_frames', 
+                   '-of', 'default=noprint_wrappers=1:nokey=1', rgb_video]
+temp_depth_frames_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', 
+                          '-count_frames', '-show_entries', 'stream=nb_frames', 
+                          '-of', 'default=noprint_wrappers=1:nokey=1', temp_depth]
+
 try:
-    pts_result = subprocess.run(pts_cmd, capture_output=True, text=True, check=True)
-    rgb_pts_lines = [x.strip() for x in pts_result.stdout.strip().split('\n') if x.strip()]
-    rgb_pts = [float(x) for x in rgb_pts_lines]
-    print(f"Extracted {len(rgb_pts)} PTS values from RGB video")
-    if len(rgb_pts) > 0:
-        print(f"First PTS: {rgb_pts[0]}, Last PTS: {rgb_pts[-1]}")
+    rgb_frames = int(subprocess.run(rgb_frames_cmd, capture_output=True, text=True, check=True).stdout.strip())
+    temp_depth_frames = int(subprocess.run(temp_depth_frames_cmd, capture_output=True, text=True, check=True).stdout.strip())
+    
+    print(f"RGB video frames: {rgb_frames}")
+    print(f"Concatenated depth frames: {temp_depth_frames}")
+    
+    # CRITICAL: Validate frame counts match EXACTLY before re-encoding
+    if rgb_frames != temp_depth_frames:
+        print(f"❌ CRITICAL ERROR: Concatenated depth frame count does not match RGB!", file=sys.stderr)
+        print(f"  RGB frames: {rgb_frames}", file=sys.stderr)
+        print(f"  Depth frames: {temp_depth_frames}", file=sys.stderr)
+        print(f"  This indicates scene depth videos have incorrect frame counts.", file=sys.stderr)
+        print(f"  DO NOT BANDAGE - Fix the root cause!", file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"✅ Frame counts match: {rgb_frames} frames")
+    
 except Exception as e:
-    print(f"Error extracting PTS: {e}", file=sys.stderr)
+    print(f"Error verifying frame counts: {e}", file=sys.stderr)
     sys.exit(1)
 
-# Re-encode depth video with exact frame count and timing, but keep depth resolution
-# Use constant frame rate and ensure frame count matches RGB exactly
-print(f"Re-encoding depth video with exact timing match (keeping resolution {depth_width}x{depth_height})...")
+# Re-encode depth video to match RGB video encoding exactly (same timebase)
+# Use the EXACT same encoding parameters as RGB to ensure matching timebase
+print(f"Re-encoding depth video with exact encoding match (keeping resolution {depth_width}x{depth_height})...")
+# Use -vf fps= EXACTLY like rgb.mp4 encoding to get the same timebase
 cmd = ['ffmpeg', '-i', temp_depth,
-       '-vf', f'fps=fps={rgb_fps},scale={depth_width}:{depth_height}',
-       '-r', str(rgb_fps),
+       '-vf', f'fps=fps={rgb_fps}',
        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18',
-       '-vsync', 'cfr',  # Constant frame rate
-       '-fflags', '+genpts']  # Generate PTS
-if rgb_duration:
-    cmd.extend(['-t', str(rgb_duration)])
-cmd.extend(['-y', depth_video])
+       '-y', depth_video]
 
 result = subprocess.run(cmd, capture_output=True, text=True)
 if result.returncode != 0:
     print(f"Error re-encoding: {result.stderr}", file=sys.stderr)
     sys.exit(1)
 
-# Verify frame count matches
-print("Verifying frame count matches...")
-rgb_frames_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', 
-                   '-count_frames', '-show_entries', 'stream=nb_frames', 
-                   '-of', 'default=noprint_wrappers=1:nokey=1', rgb_video]
+# CRITICAL: Verify final frame count matches exactly
+print("Verifying final frame count matches...")
 depth_frames_cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', 
                      '-count_frames', '-show_entries', 'stream=nb_frames', 
                      '-of', 'default=noprint_wrappers=1:nokey=1', depth_video]
 
 try:
-    rgb_frames = subprocess.run(rgb_frames_cmd, capture_output=True, text=True, check=True).stdout.strip()
-    depth_frames = subprocess.run(depth_frames_cmd, capture_output=True, text=True, check=True).stdout.strip()
-    if rgb_frames and depth_frames and rgb_frames == depth_frames:
-        print(f"✅ Frame count matches: {rgb_frames} frames")
-    else:
-        print(f"⚠️  Frame count mismatch: RGB={rgb_frames}, Depth={depth_frames}", file=sys.stderr)
+    final_depth_frames = int(subprocess.run(depth_frames_cmd, capture_output=True, text=True, check=True).stdout.strip())
+    
+    if final_depth_frames != rgb_frames:
+        print(f"❌ CRITICAL ERROR: Final depth frame count does not match RGB after re-encoding!", file=sys.stderr)
+        print(f"  RGB frames: {rgb_frames}", file=sys.stderr)
+        print(f"  Final depth frames: {final_depth_frames}", file=sys.stderr)
+        print(f"  Re-encoding altered frame count - this should never happen!", file=sys.stderr)
+        sys.exit(1)
+    
+    print(f"✅ Final frame count verified: {final_depth_frames} frames")
+    
 except Exception as e:
-    print(f"Warning: Could not verify frame count: {e}", file=sys.stderr)
+    print(f"Error verifying final frame count: {e}", file=sys.stderr)
+    sys.exit(1)
 
 print("✅ Depth video re-encoded")
 EOF
@@ -1182,16 +1325,19 @@ EOF
         echo "depth.mp4 already exists, skipping creation" | tee -a "$LOG_FILE"
     fi
     
-    # Verify RGB and depth match with strict checks
+    # CRITICAL: Verify RGB and depth match with strict checks - fail catastrophically on any mismatch
     if [ -f "$RGB_VIDEO" ] && [ -f "$DEPTH_VIDEO" ]; then
         echo "" | tee -a "$LOG_FILE"
         echo "========================================" | tee -a "$LOG_FILE"
-        echo "Verifying RGB and depth video synchronization..." | tee -a "$LOG_FILE"
+        echo "CRITICAL VALIDATION: Verifying RGB and depth video synchronization..." | tee -a "$LOG_FILE"
         echo "========================================" | tee -a "$LOG_FILE"
         if ! verify_videos_match "$RGB_VIDEO" "$DEPTH_VIDEO"; then
-            echo "❌ CRITICAL: Synchronization verification failed!" | tee -a "$LOG_FILE"
+            echo "❌ CATASTROPHIC FAILURE: RGB and depth videos are not synchronized!" | tee -a "$LOG_FILE"
+            echo "This should NEVER happen and indicates a fundamental problem in the pipeline." | tee -a "$LOG_FILE"
+            echo "DO NOT attempt to bandage this - fix the root cause!" | tee -a "$LOG_FILE"
             exit 1
         fi
+        echo "✅ VALIDATION PASSED: RGB and depth videos are perfectly synchronized" | tee -a "$LOG_FILE"
     fi
     
     # Combine scene npz files into single depth.npz if --npz flag is set
@@ -1311,18 +1457,23 @@ scene_count = len(scene_timestamps)
 
 # Build scene depth stats arrays
 scene_depth_stats = {}
-for stat in '''${SCENE_DEPTH_STATS[@]}'''.split():
-    if ':' in stat:
-        parts = stat.split(':', 1)
-        if len(parts) == 2:
-            scene_num, depths = parts
-            depth_parts = depths.split()
-            if len(depth_parts) == 2:
-                min_depth, max_depth = depth_parts
-                scene_depth_stats[int(scene_num)] = {
-                    "min_depth": float(min_depth),
-                    "max_depth": float(max_depth)
-                }
+# SCENE_DEPTH_STATS is a bash array, passed as space-separated string
+# Each element is "scene_num:min_depth max_depth" (note: space in depth values!)
+# We need to parse carefully to handle spaces in depth values
+stats_str = '''${SCENE_DEPTH_STATS[@]}'''
+if stats_str.strip():
+    # Split by pattern: number followed by colon (this preserves spaces in depth values)
+    import re
+    # Find all patterns like "N:value1 value2" where N is scene number
+    # Use regex to match scene_num:min max pattern
+    pattern = r'(\d+):([\d.]+)\s+([\d.]+)'
+    matches = re.findall(pattern, stats_str)
+    for scene_num_str, min_depth_str, max_depth_str in matches:
+        scene_num = int(scene_num_str)
+        scene_depth_stats[scene_num] = {
+            "min_depth": float(min_depth_str),
+            "max_depth": float(max_depth_str)
+        }
 
 # Build arrays matching scene count
 scene_min_depths = []
@@ -1352,9 +1503,8 @@ with open(metadata_file, 'w') as f:
     json.dump(metadata, f, indent=2)
 EOF
 
-calculate_depth_dimensions "$METADATA_WIDTH" "$METADATA_HEIGHT" "$MAX_RES"
-
 # Create/update metadata JSON with all information
+# Note: DEPTH_WIDTH and DEPTH_HEIGHT are already set from calculate_crop_and_depth_dimensions earlier
 python3 <<EOF | tee -a "$LOG_FILE"
 import json
 from pathlib import Path
