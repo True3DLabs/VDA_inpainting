@@ -11,6 +11,7 @@ MAX_LEN=""
 MAX_CLIP=20
 NO_DEPTH=false
 NO_EXPORT=false
+SAVE_NPZ=false
 DA3_MODEL_DIR="depth-anything/DA3NESTED-GIANT-LARGE"
 BACKEND_URL="http://localhost:8008"
 USE_BACKEND=false
@@ -31,6 +32,8 @@ while [ $# -gt 0 ]; do
       NO_DEPTH=true; shift ;;
     --no-export)
       NO_EXPORT=true; shift ;;
+    --npz)
+      SAVE_NPZ=true; shift ;;
     --da3-model-dir)
       DA3_MODEL_DIR="$2"; shift 2 ;;
     --backend-url)
@@ -47,6 +50,7 @@ Options:
                     Scenes exceeding this will get flat depth (value 100)
   --no-depth        Skip depth estimation
   --no-export       Skip export.zip creation
+  --npz             Save raw metric depth values to depth.npz (unquantized)
   --da3-model-dir DIR  Path to DA3 model directory (default: depth-anything/DA3NESTED-GIANT-LARGE)
   --backend-url URL    DA3 backend URL (optional, enables backend mode if provided)
   --help            Show this help message
@@ -125,6 +129,7 @@ SCENES_DIR="${ROOT_DIR}/scenes"
 METADATA_FILE="${ROOT_DIR}/metadata.json"
 RGB_VIDEO="${ROOT_DIR}/rgb.mp4"
 DEPTH_VIDEO="${ROOT_DIR}/depth.mp4"
+DEPTH_NPZ="${ROOT_DIR}/depth.npz"
 LOG_FILE="${ROOT_DIR}/log.txt"
 SCENE_SPLIT_SCRIPT="${SCRIPT_DIR}/scene_split.py"
 
@@ -167,7 +172,15 @@ extract_video_metadata() {
     METADATA_NUM_FRAMES=$num_frames
 }
 
-# Function to calculate depth dimensions based on MAX_RES
+# Function to round to nearest multiple of N
+round_to_multiple() {
+    local value=$1
+    local multiple=$2
+    echo $(( ((value + multiple/2) / multiple) * multiple ))
+}
+
+# Function to calculate dimensions that are multiples of 14 (required by depth model)
+# and respect MAX_RES constraint
 calculate_depth_dimensions() {
     local width=$1
     local height=$2
@@ -181,13 +194,48 @@ calculate_depth_dimensions() {
         local scale=$(echo "$max_res $max_hw" | awk '{print $1 / $2}')
         DEPTH_WIDTH=$(echo "$width $scale" | awk '{printf "%.0f", $1 * $2}')
         DEPTH_HEIGHT=$(echo "$height $scale" | awk '{printf "%.0f", $1 * $2}')
-        # Ensure dimensions are even (required by some codecs)
-        DEPTH_WIDTH=$((DEPTH_WIDTH - (DEPTH_WIDTH % 2)))
-        DEPTH_HEIGHT=$((DEPTH_HEIGHT - (DEPTH_HEIGHT % 2)))
     fi
+    
+    # Round to nearest multiple of 14 (required by depth model)
+    DEPTH_WIDTH=$(round_to_multiple $DEPTH_WIDTH 14)
+    DEPTH_HEIGHT=$(round_to_multiple $DEPTH_HEIGHT 14)
+    
+    # Ensure dimensions are even (required by some codecs)
+    DEPTH_WIDTH=$((DEPTH_WIDTH - (DEPTH_WIDTH % 2)))
+    DEPTH_HEIGHT=$((DEPTH_HEIGHT - (DEPTH_HEIGHT % 2)))
+    
+    # Re-verify multiple of 14 after ensuring even (may need to adjust)
+    DEPTH_WIDTH=$(round_to_multiple $DEPTH_WIDTH 14)
+    DEPTH_HEIGHT=$(round_to_multiple $DEPTH_HEIGHT 14)
 }
 
-# Function to verify video properties match
+# Function to resize video to dimensions that are multiples of 14
+resize_video_to_multiple_of_14() {
+    local input_video="$1"
+    local output_video="$2"
+    local max_res=$3
+    
+    extract_video_metadata "$input_video"
+    local orig_width=$METADATA_WIDTH
+    local orig_height=$METADATA_HEIGHT
+    
+    calculate_depth_dimensions "$orig_width" "$orig_height" "$max_res"
+    
+    if [ "$orig_width" -eq "$DEPTH_WIDTH" ] && [ "$orig_height" -eq "$DEPTH_HEIGHT" ]; then
+        echo "Video dimensions ($orig_width x $orig_height) already match 14-pixel multiple constraint, no resize needed"
+        return 0
+    fi
+    
+    echo "Resizing video from ${orig_width}x${orig_height} to ${DEPTH_WIDTH}x${DEPTH_HEIGHT} (multiples of 14)"
+    ffmpeg -i "$input_video" -vf "scale=${DEPTH_WIDTH}:${DEPTH_HEIGHT}" -c:v libx264 -pix_fmt yuv420p -crf 18 -y "$output_video" >/dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to resize video" >&2
+        return 1
+    fi
+    return 0
+}
+
+# Function to verify video properties match with strict checks
 verify_videos_match() {
     local video1="$1"
     local video2="$2"
@@ -201,30 +249,90 @@ verify_videos_match() {
     local frames1=$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_frames -of default=noprint_wrappers=1:nokey=1 "$video1" 2>/dev/null || echo "")
     local frames2=$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=nb_frames -of default=noprint_wrappers=1:nokey=1 "$video2" 2>/dev/null || echo "")
     
+    local width1=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$video1")
+    local width2=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$video2")
+    
+    local height1=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$video1")
+    local height2=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$video2")
+    
+    # Extract PTS information (first and last frame PTS)
+    local pts1_start=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts_time -of csv=p=0 "$video1" 2>/dev/null | head -n1 || echo "")
+    local pts1_end=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts_time -of csv=p=0 "$video1" 2>/dev/null | tail -n1 || echo "")
+    local pts2_start=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts_time -of csv=p=0 "$video2" 2>/dev/null | head -n1 || echo "")
+    local pts2_end=$(ffprobe -v error -select_streams v:0 -show_entries frame=pkt_pts_time -of csv=p=0 "$video2" 2>/dev/null | tail -n1 || echo "")
+    
     local mismatch=false
+    local critical_mismatch=false
     
-    if [ -n "$frames1" ] && [ -n "$frames2" ] && [ "$frames1" != "$frames2" ]; then
-        echo "⚠️  SEVERE WARNING: Frame count mismatch! RGB: $frames1, Depth: $frames2" | tee -a "$LOG_FILE"
+    # Check dimensions (must match exactly)
+    if [ "$width1" != "$width2" ] || [ "$height1" != "$height2" ]; then
+        echo "❌ CRITICAL: Dimension mismatch! RGB: ${width1}x${height1}, Depth: ${width2}x${height2}" | tee -a "$LOG_FILE"
+        critical_mismatch=true
         mismatch=true
     fi
     
+    # Check frame count (must match exactly)
+    if [ -n "$frames1" ] && [ -n "$frames2" ]; then
+        if [ "$frames1" != "$frames2" ]; then
+            echo "❌ CRITICAL: Frame count mismatch! RGB: $frames1, Depth: $frames2" | tee -a "$LOG_FILE"
+            critical_mismatch=true
+            mismatch=true
+        fi
+    elif [ -z "$frames1" ] || [ -z "$frames2" ]; then
+        echo "⚠️  WARNING: Could not determine frame count for one or both videos" | tee -a "$LOG_FILE"
+    fi
+    
+    # Check FPS (must match exactly, tolerance 0.001)
     local fps_diff=$(echo "$fps1 $fps2" | awk '{diff = ($1 > $2) ? ($1 - $2) : ($2 - $1); print diff}')
-    if [ "$(echo "$fps_diff > 0.01" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
-        echo "⚠️  SEVERE WARNING: FPS mismatch! RGB: $fps1, Depth: $fps2" | tee -a "$LOG_FILE"
+    if [ "$(echo "$fps_diff > 0.001" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+        echo "❌ CRITICAL: FPS mismatch! RGB: $fps1, Depth: $fps2 (diff: $fps_diff)" | tee -a "$LOG_FILE"
+        critical_mismatch=true
         mismatch=true
     fi
     
+    # Check duration (must match exactly, tolerance 0.01s)
     local dur_diff=$(echo "$duration1 $duration2" | awk '{diff = ($1 > $2) ? ($1 - $2) : ($2 - $1); print diff}')
-    if [ "$(echo "$dur_diff > 0.1" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
-        echo "⚠️  SEVERE WARNING: Duration mismatch! RGB: ${duration1}s, Depth: ${duration2}s" | tee -a "$LOG_FILE"
+    if [ "$(echo "$dur_diff > 0.01" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+        echo "❌ CRITICAL: Duration mismatch! RGB: ${duration1}s, Depth: ${duration2}s (diff: ${dur_diff}s)" | tee -a "$LOG_FILE"
+        critical_mismatch=true
         mismatch=true
     fi
     
-    if [ "$mismatch" = true ]; then
-        echo "❌ CRITICAL: RGB and depth videos do not match! This may cause synchronization issues." | tee -a "$LOG_FILE"
+    # Check PTS (presentation timestamps) - must match exactly
+    if [ -n "$pts1_start" ] && [ -n "$pts2_start" ] && [ -n "$pts1_end" ] && [ -n "$pts2_end" ]; then
+        local pts_start_diff=$(echo "$pts1_start $pts2_start" | awk '{diff = ($1 > $2) ? ($1 - $2) : ($2 - $1); print diff}')
+        local pts_end_diff=$(echo "$pts1_end $pts2_end" | awk '{diff = ($1 > $2) ? ($1 - $2) : ($2 - $1); print diff}')
+        
+        if [ "$(echo "$pts_start_diff > 0.001" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+            echo "❌ CRITICAL: PTS start mismatch! RGB: $pts1_start, Depth: $pts2_start (diff: $pts_start_diff)" | tee -a "$LOG_FILE"
+            critical_mismatch=true
+            mismatch=true
+        fi
+        
+        if [ "$(echo "$pts_end_diff > 0.001" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+            echo "❌ CRITICAL: PTS end mismatch! RGB: $pts1_end, Depth: $pts2_end (diff: $pts_end_diff)" | tee -a "$LOG_FILE"
+            critical_mismatch=true
+            mismatch=true
+        fi
+    else
+        echo "⚠️  WARNING: Could not extract PTS information for verification" | tee -a "$LOG_FILE"
+    fi
+    
+    if [ "$critical_mismatch" = true ]; then
+        echo "❌ CRITICAL SYNCHRONIZATION FAILURE: Videos do not match! This will cause severe desyncing issues." | tee -a "$LOG_FILE"
+        return 1
+    elif [ "$mismatch" = true ]; then
+        echo "⚠️  WARNING: Some video properties do not match exactly" | tee -a "$LOG_FILE"
         return 1
     else
-        echo "✅ RGB and depth videos match (FPS: $fps1, Duration: ${duration1}s, Frames: ${frames1:-N/A})" | tee -a "$LOG_FILE"
+        echo "✅ Videos match exactly:" | tee -a "$LOG_FILE"
+        echo "   Dimensions: ${width1}x${height1}" | tee -a "$LOG_FILE"
+        echo "   FPS: $fps1" | tee -a "$LOG_FILE"
+        echo "   Duration: ${duration1}s" | tee -a "$LOG_FILE"
+        echo "   Frames: ${frames1:-N/A}" | tee -a "$LOG_FILE"
+        if [ -n "$pts1_start" ] && [ -n "$pts1_end" ]; then
+            echo "   PTS: ${pts1_start}s - ${pts1_end}s" | tee -a "$LOG_FILE"
+        fi
         return 0
     fi
 }
@@ -293,7 +401,20 @@ with open(metadata_file, "w") as f:
 EOF
 fi
 
-# Step 1: Split video into scenes
+# Step 1: Resize input video to match 14-pixel multiple constraint (if needed)
+PREPROCESSED_VIDEO="${ROOT_DIR}/.preprocessed_input.mp4"
+if [ "$IS_NEW_RUN" = true ] || [ ! -f "$PREPROCESSED_VIDEO" ]; then
+    echo "Preprocessing input video to match 14-pixel multiple constraint..." | tee -a "$LOG_FILE"
+    if ! resize_video_to_multiple_of_14 "$INPUT_VIDEO" "$PREPROCESSED_VIDEO" "$MAX_RES"; then
+        echo "Error: Failed to preprocess input video" >&2
+        exit 1
+    fi
+    echo "Preprocessed video saved to: $PREPROCESSED_VIDEO" | tee -a "$LOG_FILE"
+else
+    echo "Using existing preprocessed video: $PREPROCESSED_VIDEO" | tee -a "$LOG_FILE"
+fi
+
+# Step 2: Split video into scenes
 if [ "$IS_NEW_RUN" = true ] || [ ! -d "$SCENES_DIR" ] || [ -z "$(ls -A "$SCENES_DIR" 2>/dev/null)" ]; then
     echo "Splitting video into scenes..." | tee -a "$LOG_FILE"
     mkdir -p "$SCENES_DIR"
@@ -303,10 +424,10 @@ if [ "$IS_NEW_RUN" = true ] || [ ! -d "$SCENES_DIR" ] || [ -z "$(ls -A "$SCENES_
         exit 1
     fi
     
-    # Split video with MAX_LEN cropping if specified
+    # Split preprocessed video with MAX_LEN cropping if specified
     # Use temporary file for timestamps, then store in metadata.json
     TEMP_TIMESTAMPS="${ROOT_DIR}/.temp_scene_timestamps.json"
-    SCENE_SPLIT_ARGS=("$INPUT_VIDEO" "-o" "$SCENES_DIR")
+    SCENE_SPLIT_ARGS=("$PREPROCESSED_VIDEO" "-o" "$SCENES_DIR")
     if [ -n "$MAX_LEN" ]; then
         SCENE_SPLIT_ARGS+=("--max-len" "$MAX_LEN")
     fi
@@ -357,11 +478,16 @@ fi
 
 echo "Found $SCENE_COUNT scenes" | tee -a "$LOG_FILE"
 
-# Step 2: Process RGB scenes (reencode with proper FPS)
+# Step 3: Process RGB scenes (reencode with proper FPS)
 if [ ! -f "$RGB_VIDEO" ]; then
     echo "Creating rgb.mp4 from scenes..." | tee -a "$LOG_FILE"
     
-    extract_video_metadata "$INPUT_VIDEO"
+    # Use preprocessed video for metadata if available, otherwise original
+    if [ -f "$PREPROCESSED_VIDEO" ]; then
+        extract_video_metadata "$PREPROCESSED_VIDEO"
+    else
+        extract_video_metadata "$INPUT_VIDEO"
+    fi
     
     # Create concat file for ffmpeg
     CONCAT_FILE="${ROOT_DIR}/rgb_concat.txt"
@@ -391,9 +517,28 @@ if [ ! -f "$RGB_VIDEO" ]; then
     
     rm -rf "$TEMP_SCENES_DIR" "$CONCAT_FILE"
     
+    # Extract final RGB video properties for reference
+    extract_video_metadata "$RGB_VIDEO"
+    RGB_FPS=$METADATA_ACTUAL_FPS
+    RGB_DURATION=$METADATA_DURATION
+    RGB_FRAMES=$METADATA_NUM_FRAMES
+    RGB_WIDTH=$METADATA_WIDTH
+    RGB_HEIGHT=$METADATA_HEIGHT
+    
     echo "rgb.mp4 created: $RGB_VIDEO" | tee -a "$LOG_FILE"
+    echo "RGB video properties:" | tee -a "$LOG_FILE"
+    echo "  Dimensions: ${RGB_WIDTH}x${RGB_HEIGHT}" | tee -a "$LOG_FILE"
+    echo "  FPS: $RGB_FPS" | tee -a "$LOG_FILE"
+    echo "  Duration: ${RGB_DURATION}s" | tee -a "$LOG_FILE"
+    echo "  Frames: ${RGB_FRAMES:-N/A}" | tee -a "$LOG_FILE"
 else
-    echo "rgb.mp4 already exists, skipping creation" | tee -a "$LOG_FILE"
+    echo "rgb.mp4 already exists, extracting properties..." | tee -a "$LOG_FILE"
+    extract_video_metadata "$RGB_VIDEO"
+    RGB_FPS=$METADATA_ACTUAL_FPS
+    RGB_DURATION=$METADATA_DURATION
+    RGB_FRAMES=$METADATA_NUM_FRAMES
+    RGB_WIDTH=$METADATA_WIDTH
+    RGB_HEIGHT=$METADATA_HEIGHT
 fi
 
 # Step 3: Process depth scenes with da3 (unless --no-depth)
@@ -688,6 +833,35 @@ EOF
                         echo "  ❌ Error: Failed to create depth video for $scene_name, skipping..." | tee -a "$LOG_FILE"
                         continue
                     fi
+                    
+                    # Re-encode scene depth video to match scene RGB video exactly
+                    echo "  → Re-encoding depth video to match scene RGB exactly..." | tee -a "$LOG_FILE"
+                    scene_rgb_fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=noprint_wrappers=1:nokey=1 "$scene_file" | awk -F'/' '{if ($2+0 == 0) print 0; else print ($1+0)/($2+0)}')
+                    scene_rgb_duration=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$scene_file")
+                    scene_rgb_width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=noprint_wrappers=1:nokey=1 "$scene_file")
+                    scene_rgb_height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=noprint_wrappers=1:nokey=1 "$scene_file")
+                    
+                    TEMP_SCENE_DEPTH="${scene_depth_video}.tmp"
+                    mv "$scene_depth_video" "$TEMP_SCENE_DEPTH"
+                    FFMPEG_CMD=(ffmpeg -i "$TEMP_SCENE_DEPTH" -vf "fps=fps=${scene_rgb_fps},scale=${scene_rgb_width}:${scene_rgb_height}" -c:v libx264 -pix_fmt yuv420p -crf 18)
+                    if [ -n "$scene_rgb_duration" ]; then
+                        FFMPEG_CMD+=(-t "$scene_rgb_duration")
+                    fi
+                    FFMPEG_CMD+=(-y "$scene_depth_video")
+                    if ! "${FFMPEG_CMD[@]}" >/dev/null 2>&1; then
+                        echo "  ⚠️  Warning: Failed to re-encode scene depth video, using original" | tee -a "$LOG_FILE"
+                        mv "$TEMP_SCENE_DEPTH" "$scene_depth_video"
+                    else
+                        rm -f "$TEMP_SCENE_DEPTH"
+                        echo "    ✅ Scene depth video re-encoded to match scene RGB" | tee -a "$LOG_FILE"
+                    fi
+                    
+                    # Verify scene depth matches scene RGB
+                    echo "  → Verifying scene synchronization..." | tee -a "$LOG_FILE"
+                    if ! verify_videos_match "$scene_file" "$scene_depth_video"; then
+                        echo "  ⚠️  WARNING: Scene $scene_name depth video synchronization issues detected" | tee -a "$LOG_FILE"
+                    fi
+                    
                     echo "    ✅ Depth video created: $scene_depth_video" | tee -a "$LOG_FILE"
                     
                     # Extract depth stats
@@ -757,11 +931,27 @@ EOF
         if [ -s "$CONCAT_FILE" ]; then
             echo "Concatenating $SCENES_TO_STITCH depth scenes..." | tee -a "$LOG_FILE"
             STITCH_START_TIME=$(date +%s)
-            ffmpeg -f concat -safe 0 -i "$CONCAT_FILE" -c:v libx264 -pix_fmt yuv420p -crf 18 -y "$DEPTH_VIDEO" >/dev/null 2>&1
+            TEMP_DEPTH="${DEPTH_VIDEO}.tmp"
+            ffmpeg -f concat -safe 0 -i "$CONCAT_FILE" -c:v libx264 -pix_fmt yuv420p -crf 18 -y "$TEMP_DEPTH" >/dev/null 2>&1
             STITCH_END_TIME=$(date +%s)
             STITCH_DURATION=$((STITCH_END_TIME - STITCH_START_TIME))
             rm "$CONCAT_FILE"
-            echo "✅ depth.mp4 created in ${STITCH_DURATION}s: $DEPTH_VIDEO" | tee -a "$LOG_FILE"
+            echo "✅ Depth scenes concatenated in ${STITCH_DURATION}s" | tee -a "$LOG_FILE"
+            
+            # Re-encode depth video to match RGB video exactly (same fps, duration, frame count, dimensions)
+            echo "Re-encoding depth video to match rgb.mp4 exactly..." | tee -a "$LOG_FILE"
+            FFMPEG_CMD=(ffmpeg -i "$TEMP_DEPTH" -vf "fps=fps=${RGB_FPS},scale=${RGB_WIDTH}:${RGB_HEIGHT}" -c:v libx264 -pix_fmt yuv420p -crf 18)
+            if [ -n "$RGB_DURATION" ]; then
+                FFMPEG_CMD+=(-t "$RGB_DURATION")
+            fi
+            FFMPEG_CMD+=(-y "$DEPTH_VIDEO")
+            if ! "${FFMPEG_CMD[@]}" >/dev/null 2>&1; then
+                echo "Error: Failed to re-encode depth video" >&2
+                mv "$TEMP_DEPTH" "$DEPTH_VIDEO"
+                exit 1
+            fi
+            rm -f "$TEMP_DEPTH"
+            echo "✅ depth.mp4 re-encoded to match rgb.mp4 exactly" | tee -a "$LOG_FILE"
         else
             echo "Error: No depth scenes to concatenate" >&2
             exit 1
@@ -770,9 +960,99 @@ EOF
         echo "depth.mp4 already exists, skipping creation" | tee -a "$LOG_FILE"
     fi
     
-    # Verify RGB and depth match
+    # Verify RGB and depth match with strict checks
     if [ -f "$RGB_VIDEO" ] && [ -f "$DEPTH_VIDEO" ]; then
-        verify_videos_match "$RGB_VIDEO" "$DEPTH_VIDEO"
+        echo "" | tee -a "$LOG_FILE"
+        echo "========================================" | tee -a "$LOG_FILE"
+        echo "Verifying RGB and depth video synchronization..." | tee -a "$LOG_FILE"
+        echo "========================================" | tee -a "$LOG_FILE"
+        if ! verify_videos_match "$RGB_VIDEO" "$DEPTH_VIDEO"; then
+            echo "❌ CRITICAL: Synchronization verification failed!" | tee -a "$LOG_FILE"
+            exit 1
+        fi
+    fi
+    
+    # Combine scene npz files into single depth.npz if --npz flag is set
+    if [ "$SAVE_NPZ" = true ]; then
+        if [ ! -f "$DEPTH_NPZ" ]; then
+            echo "" | tee -a "$LOG_FILE"
+            echo "========================================" | tee -a "$LOG_FILE"
+            echo "Combining scene depth npz files into depth.npz..." | tee -a "$LOG_FILE"
+            echo "========================================" | tee -a "$LOG_FILE"
+            
+            python3 <<EOF | tee -a "$LOG_FILE"
+import numpy as np
+from pathlib import Path
+import sys
+
+scenes_dir = Path("$SCENES_DIR")
+depth_npz_output = Path("$DEPTH_NPZ")
+
+# Collect all scene npz files in order
+scene_npz_files = []
+for scene_file in sorted(scenes_dir.glob("scene_*.mp4")):
+    scene_name = scene_file.stem
+    scene_dir_path = scenes_dir / scene_name
+    scene_npz = scene_dir_path / "exports" / "mini_npz" / "results.npz"
+    
+    if scene_npz.exists():
+        scene_npz_files.append(scene_npz)
+        print(f"Found npz for {scene_name}: {scene_npz}")
+    else:
+        print(f"Warning: No npz file found for {scene_name}, skipping...", file=sys.stderr)
+
+if not scene_npz_files:
+    print("Error: No scene npz files found to combine", file=sys.stderr)
+    sys.exit(1)
+
+# Load and combine all depth arrays
+all_depths = []
+for npz_file in scene_npz_files:
+    data = np.load(npz_file)
+    if 'depth' not in data:
+        print(f"Warning: No 'depth' key in {npz_file}, skipping...", file=sys.stderr)
+        continue
+    
+    depth = data['depth']
+    
+    # Handle different depth array shapes
+    if depth.ndim == 2:
+        # Single frame - add frame dimension
+        depth = depth[np.newaxis, ...]
+    elif depth.ndim == 3:
+        # Check if shape is (height, width, frames) and transpose if needed
+        if depth.shape[2] < depth.shape[0] and depth.shape[2] < depth.shape[1]:
+            # Shape is likely (height, width, frames) - transpose to (frames, height, width)
+            depth = np.transpose(depth, (2, 0, 1))
+        # Otherwise assume it's already (frames, height, width)
+    
+    all_depths.append(depth)
+    print(f"  Loaded {depth.shape} from {npz_file.name}")
+
+if not all_depths:
+    print("Error: No valid depth data found in any scene npz files", file=sys.stderr)
+    sys.exit(1)
+
+# Concatenate along frame dimension
+combined_depth = np.concatenate(all_depths, axis=0)
+print(f"\nCombined depth shape: {combined_depth.shape}")
+print(f"Total frames: {combined_depth.shape[0]}")
+
+# Save combined depth to npz
+np.savez_compressed(depth_npz_output, depth=combined_depth)
+print(f"\n✅ Saved combined depth.npz to: {depth_npz_output}")
+print(f"   Shape: {combined_depth.shape}")
+print(f"   Dtype: {combined_depth.dtype}")
+EOF
+            
+            if [ ! -f "$DEPTH_NPZ" ]; then
+                echo "Warning: Failed to create depth.npz, but continuing..." | tee -a "$LOG_FILE"
+            else
+                echo "✅ depth.npz created successfully" | tee -a "$LOG_FILE"
+            fi
+        else
+            echo "depth.npz already exists, skipping combination" | tee -a "$LOG_FILE"
+        fi
     fi
 else
     echo "Skipping depth estimation (--no-depth specified)" | tee -a "$LOG_FILE"
@@ -782,7 +1062,14 @@ fi
 echo "Updating metadata.json..." | tee -a "$LOG_FILE"
 extract_video_metadata "$RGB_VIDEO"
 
-# Load existing metadata or create new
+# Count extracted frames (main_v2.sh doesn't extract frames, so this will be 0)
+FRAMES_DIR="${ROOT_DIR}/frames"
+EXTRACTED_FRAMES=0
+if [ -d "$FRAMES_DIR" ]; then
+    EXTRACTED_FRAMES=$(ls -1 "${FRAMES_DIR}"/frame_*.png 2>/dev/null | wc -l)
+fi
+
+# Build scene depth stats arrays
 python3 <<EOF
 import json
 from pathlib import Path
@@ -795,9 +1082,13 @@ if metadata_file.exists():
 
 # Get scene timestamps from metadata
 scene_timestamps = metadata.get('scene_timestamps', [])
+if not scene_timestamps or len(scene_timestamps) == 0:
+    scene_timestamps = [0.0]
 
-# Build scene metadata with depth stats
-scene_depth_stats = []
+scene_count = len(scene_timestamps)
+
+# Build scene depth stats arrays
+scene_depth_stats = {}
 for stat in '''${SCENE_DEPTH_STATS[@]}'''.split():
     if ':' in stat:
         parts = stat.split(':', 1)
@@ -806,32 +1097,33 @@ for stat in '''${SCENE_DEPTH_STATS[@]}'''.split():
             depth_parts = depths.split()
             if len(depth_parts) == 2:
                 min_depth, max_depth = depth_parts
-                scene_depth_stats.append({
-                    "scene_number": int(scene_num),
+                scene_depth_stats[int(scene_num)] = {
                     "min_depth": float(min_depth),
                     "max_depth": float(max_depth)
-                })
+                }
 
-flat_depth_scenes = []
-for flat_scene in '''${SCENE_FLAT_DEPTH[@]}'''.split():
-    if flat_scene:
-        flat_depth_scenes.append(int(flat_scene))
+# Build arrays matching scene count
+scene_min_depths = []
+scene_max_depths = []
+for i in range(scene_count):
+    scene_num = i + 1
+    if scene_num in scene_depth_stats:
+        scene_min_depths.append(scene_depth_stats[scene_num]["min_depth"])
+        scene_max_depths.append(scene_depth_stats[scene_num]["max_depth"])
+    else:
+        # Default values if no depth stats available
+        scene_min_depths.append(1.0)
+        scene_max_depths.append(10.0)
 
-scenes = []
-for i, timestamp in enumerate(scene_timestamps):
-    scene_info = {"start_time": timestamp}
-    # Find matching depth stats
-    for stat in scene_depth_stats:
-        if stat["scene_number"] == i + 1:
-            scene_info["min_depth"] = stat["min_depth"]
-            scene_info["max_depth"] = stat["max_depth"]
-            break
-    # Mark if flat depth
-    if (i + 1) in flat_depth_scenes:
-        scene_info["flat_depth"] = True
-    scenes.append(scene_info)
+# Create scene_fovs array (default 60)
+scene_fovs = [60.0] * scene_count
 
-metadata['scenes'] = scenes
+# Update metadata with scene arrays
+metadata['scene_timestamps'] = scene_timestamps
+metadata['scene_min_depths'] = scene_min_depths
+metadata['scene_max_depths'] = scene_max_depths
+metadata['scene_fovs'] = scene_fovs
+metadata['scene_count'] = scene_count
 
 # Write updated metadata back
 with open(metadata_file, 'w') as f:
@@ -847,13 +1139,28 @@ from pathlib import Path
 
 metadata_file = Path("$METADATA_FILE")
 
-# Load existing metadata (may have scene_timestamps and scenes already)
+# Load existing metadata (may have scene arrays already)
 metadata = {}
 if metadata_file.exists():
     with open(metadata_file, 'r') as f:
         metadata = json.load(f)
 
-# Update with video metadata (scenes already updated in previous step)
+# Ensure scene arrays exist
+scene_timestamps = metadata.get('scene_timestamps', [0.0])
+scene_min_depths = metadata.get('scene_min_depths', [])
+scene_max_depths = metadata.get('scene_max_depths', [])
+scene_fovs = metadata.get('scene_fovs', [])
+scene_count = len(scene_timestamps) if scene_timestamps else 1
+
+# Pad arrays if needed
+if len(scene_min_depths) < scene_count:
+    scene_min_depths.extend([1.0] * (scene_count - len(scene_min_depths)))
+if len(scene_max_depths) < scene_count:
+    scene_max_depths.extend([10.0] * (scene_count - len(scene_max_depths)))
+if len(scene_fovs) < scene_count:
+    scene_fovs.extend([60.0] * (scene_count - len(scene_fovs)))
+
+# Update with video metadata
 metadata.update({
     "original_fps": $METADATA_ORIGINAL_FPS,
     "fps": $METADATA_ACTUAL_FPS,
@@ -865,28 +1172,24 @@ metadata.update({
     "codec": "$METADATA_CODEC",
     "bitrate": $METADATA_BITRATE,
     "num_frames": ${METADATA_NUM_FRAMES:-None},
+    "extracted_frames": $EXTRACTED_FRAMES,
+    "frames_dir": "$FRAMES_DIR",
     "video_file": "$INPUT_VIDEO",
     "fov": 60,
     "max_depth": 10,
-    "depth_scale": 1.0,
-    "depth_shift": 0.0,
-    "scene_count": $SCENE_COUNT,
-    "max_res": $MAX_RES,
-    "max_fps": $MAX_FPS,
-    "max_clip": $MAX_CLIP
+    "global_depth_scale": 1.0,
+    "global_depth_shift": 0.0,
+    "scene_timestamps": scene_timestamps,
+    "scene_count": scene_count,
+    "scene_min_depths": scene_min_depths,
+    "scene_max_depths": scene_max_depths,
+    "scene_fovs": scene_fovs
 })
 
-# Ensure scenes are preserved (already updated in previous step)
-if 'scenes' not in metadata:
-    metadata['scenes'] = []
-
 max_len_str = "$MAX_LEN"
-if max_len_str:
+if max_len_str and "$METADATA_ORIGINAL_DURATION" != "$METADATA_DURATION":
+    metadata["original_duration"] = $METADATA_ORIGINAL_DURATION
     metadata["max_len"] = float(max_len_str)
-
-da3_model_dir_str = "$DA3_MODEL_DIR"
-if da3_model_dir_str:
-    metadata["da3_model_dir"] = da3_model_dir_str
 
 with open(metadata_file, "w") as f:
     json.dump(metadata, f, indent=2)
@@ -925,6 +1228,7 @@ import os
 output_dir = "$ROOT_DIR"
 export_zip = "$EXPORT_ZIP"
 depth_video = "$DEPTH_VIDEO"
+depth_npz = "$DEPTH_NPZ"
 rgb_video = "$RGB_VIDEO"
 metadata_file = "$METADATA_FILE"
 
@@ -933,6 +1237,8 @@ with zipfile.ZipFile(export_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
     zipf.write(metadata_file, os.path.basename(metadata_file))
     if os.path.exists(depth_video):
         zipf.write(depth_video, os.path.basename(depth_video))
+    if os.path.exists(depth_npz):
+        zipf.write(depth_npz, os.path.basename(depth_npz))
 
 print(f"Export complete: {export_zip}")
 print("Contents:")
