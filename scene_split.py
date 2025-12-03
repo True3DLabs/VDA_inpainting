@@ -77,7 +77,40 @@ def split_video_into_scenes(input_video, output_folder, threshold=27.0, max_len=
     
     if not scene_list:
         print("No scenes detected in the video.")
-        return [] if return_timestamps else None
+        print("Creating single scene file with entire video as scene_001.mp4...")
+        
+        # Get video duration to determine if we need to crop
+        import subprocess
+        duration_cmd = [
+            'ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', str(input_path)
+        ]
+        duration = float(subprocess.run(duration_cmd, capture_output=True, text=True, check=True).stdout.strip())
+        
+        # Determine actual duration (considering max_len)
+        actual_duration = duration
+        if max_len is not None:
+            actual_duration = min(duration, max_len)
+        
+        # Create scene_001.mp4 with entire video (or cropped if max_len specified)
+        scene_output = output_path / 'scene_001.mp4'
+        if max_len is not None:
+            subprocess.run([
+                'ffmpeg', '-i', str(input_path), '-t', str(max_len),
+                '-c:v', 'libx264', '-c:a', 'copy', '-y', str(scene_output)
+            ], check=True, capture_output=True)
+        else:
+            subprocess.run([
+                'ffmpeg', '-i', str(input_path),
+                '-c:v', 'libx264', '-c:a', 'copy', '-y', str(scene_output)
+            ], check=True, capture_output=True)
+        
+        print(f"Created scene_001.mp4 with entire video (duration: {actual_duration:.2f}s)")
+        print(f"Output file saved to: {scene_output}")
+        
+        if return_timestamps:
+            return [0.0]
+        return None
     
     print(f"\nDetected {len(scene_list)} scenes")
     
