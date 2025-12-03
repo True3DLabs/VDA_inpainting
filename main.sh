@@ -466,7 +466,21 @@ echo "Outpainting step (placeholder - not implemented yet)" | tee -a "$LOG_FILE"
 
 # Step 6: Run VDA depth estimation (unless --no-depth)
 if [ "$NO_DEPTH" = false ]; then
-    if [ ! -f "$DEPTH_VIDEO" ]; then
+    # Check if we need to run VDA based on output type
+    NEED_VDA=false
+    if [ "$SAVE_NPZ" = true ]; then
+        # When --npz is specified, check for npz file
+        if [ ! -f "$DEPTH_NPZ" ]; then
+            NEED_VDA=true
+        fi
+    else
+        # Otherwise, check for depth video
+        if [ ! -f "$DEPTH_VIDEO" ]; then
+            NEED_VDA=true
+        fi
+    fi
+    
+    if [ "$NEED_VDA" = true ]; then
         echo "Running VDA depth estimation..." | tee -a "$LOG_FILE"
         
         VDA_ENV_PREFIX="${SCRIPT_DIR}/Video-Depth-Anything/.mamba-env"
@@ -506,26 +520,35 @@ if [ "$NO_DEPTH" = false ]; then
         fi
         python "$VDA_PYTHON_SCRIPT" "${VDA_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"
         
-        # Re-encode depth video to match rgb.mp4 exactly (same fps, duration, frame count)
-        echo "Re-encoding depth video to match rgb.mp4 timing exactly..." | tee -a "$LOG_FILE"
-        TEMP_DEPTH="${DEPTH_VIDEO}.tmp"
-        mv "$DEPTH_VIDEO" "$TEMP_DEPTH"
-        
-        # Re-encode with exact rgb.mp4 FPS and ensure frame count matches
-        FFMPEG_CMD=(ffmpeg -i "$TEMP_DEPTH" -vf "fps=fps=${REFERENCE_FPS}" -c:v libx264 -pix_fmt yuv420p -crf 18)
-        if [ -n "$REFERENCE_DURATION" ]; then
-            FFMPEG_CMD+=(-t "$REFERENCE_DURATION")
+        if [ "$SAVE_NPZ" = true ]; then
+            # When --npz is specified, delete depth video and keep only npz
+            if [ -f "$DEPTH_VIDEO" ]; then
+                echo "Removing depth video (--npz specified, keeping only depth.npz)..." | tee -a "$LOG_FILE"
+                rm -f "$DEPTH_VIDEO"
+            fi
+            echo "Depth saved to depth.npz only" | tee -a "$LOG_FILE"
+        else
+            # Re-encode depth video to match rgb.mp4 exactly (same fps, duration, frame count)
+            echo "Re-encoding depth video to match rgb.mp4 timing exactly..." | tee -a "$LOG_FILE"
+            TEMP_DEPTH="${DEPTH_VIDEO}.tmp"
+            mv "$DEPTH_VIDEO" "$TEMP_DEPTH"
+            
+            # Re-encode with exact rgb.mp4 FPS and ensure frame count matches
+            FFMPEG_CMD=(ffmpeg -i "$TEMP_DEPTH" -vf "fps=fps=${REFERENCE_FPS}" -c:v libx264 -pix_fmt yuv420p -crf 18)
+            if [ -n "$REFERENCE_DURATION" ]; then
+                FFMPEG_CMD+=(-t "$REFERENCE_DURATION")
+            fi
+            FFMPEG_CMD+=(-y "$DEPTH_VIDEO")
+            if ! "${FFMPEG_CMD[@]}" >/dev/null 2>&1; then
+                echo "Error: Failed to re-encode depth video" >&2
+                mv "$TEMP_DEPTH" "$DEPTH_VIDEO"
+                exit 1
+            fi
+            rm -f "$TEMP_DEPTH"
+            echo "Depth video re-encoded to match rgb.mp4 timing" | tee -a "$LOG_FILE"
+            
+            echo "Depth video created: $DEPTH_VIDEO" | tee -a "$LOG_FILE"
         fi
-        FFMPEG_CMD+=(-y "$DEPTH_VIDEO")
-        if ! "${FFMPEG_CMD[@]}" >/dev/null 2>&1; then
-            echo "Error: Failed to re-encode depth video" >&2
-            mv "$TEMP_DEPTH" "$DEPTH_VIDEO"
-            exit 1
-        fi
-        rm -f "$TEMP_DEPTH"
-        echo "Depth video re-encoded to match rgb.mp4 timing" | tee -a "$LOG_FILE"
-        
-        echo "Depth video created: $DEPTH_VIDEO" | tee -a "$LOG_FILE"
         
         # Extract scene depth stats from VDA output if available
         SCENE_DEPTH_STATS_FILE="${ROOT_DIR}/.scene_depth_stats.json"
@@ -545,7 +568,11 @@ if [ "$NO_DEPTH" = false ]; then
             echo "Cleaned up temporary scene depth stats file" | tee -a "$LOG_FILE"
         fi
     else
-        echo "depth.mp4 already exists, skipping VDA" | tee -a "$LOG_FILE"
+        if [ "$SAVE_NPZ" = true ]; then
+            echo "depth.npz already exists, skipping VDA" | tee -a "$LOG_FILE"
+        else
+            echo "depth.mp4 already exists, skipping VDA" | tee -a "$LOG_FILE"
+        fi
         # Update metadata with depth dimensions and scene information if not already present
         SCENE_DEPTH_STATS_FILE="${ROOT_DIR}/.scene_depth_stats.json"
         if ! python3 -c "import json; data = json.load(open('$METADATA_FILE')); exit(0 if 'depth_width' in data and 'scene_timestamps' in data else 1)" 2>/dev/null; then
@@ -581,7 +608,7 @@ if [ "$NO_EXPORT" = false ]; then
             exit 1
         fi
         
-        if [ "$NO_DEPTH" = false ] && [ ! -f "$DEPTH_VIDEO" ]; then
+        if [ "$NO_DEPTH" = false ] && [ "$SAVE_NPZ" = false ] && [ ! -f "$DEPTH_VIDEO" ]; then
             echo "Error: Depth video not found: $DEPTH_VIDEO" >&2
             exit 1
         fi
@@ -594,13 +621,17 @@ import os
 output_dir = "$ROOT_DIR"
 export_zip = "$EXPORT_ZIP"
 depth_video = "$DEPTH_VIDEO"
+depth_npz = "$DEPTH_NPZ"
 rgb_video = "$REFERENCE_VIDEO"
 metadata_file = "$METADATA_FILE"
+save_npz = $SAVE_NPZ
 
 with zipfile.ZipFile(export_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
     zipf.write(rgb_video, os.path.basename(rgb_video))
     zipf.write(metadata_file, os.path.basename(metadata_file))
-    if os.path.exists(depth_video):
+    if save_npz and os.path.exists(depth_npz):
+        zipf.write(depth_npz, os.path.basename(depth_npz))
+    elif not save_npz and os.path.exists(depth_video):
         zipf.write(depth_video, os.path.basename(depth_video))
 
 print(f"Export complete: {export_zip}")
