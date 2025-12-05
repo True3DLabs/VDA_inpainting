@@ -16,9 +16,9 @@ import os
 from scipy import ndimage
 
 # Constants
-DEFAULT_BLUR_SIGMA = 9.0  # Gaussian blur sigma in pixels
+DEFAULT_BLUR_SIGMA = 7.0  # Gaussian blur sigma in pixels
 LOG_BASE = 10.0  # Natural logarithm base (e)
-SHARPEN = 0.0
+SHARPEN = 0.4
 
 
 def process_depth_npz(
@@ -30,7 +30,8 @@ def process_depth_npz(
     target_duration: float = None,
     log_base: float = LOG_BASE,
     sharpen: float = SHARPEN,
-) -> None:
+    scene_timestamps: list = None,
+) -> dict:
     """
     Process depth.npz file and save as video.
     
@@ -41,6 +42,10 @@ def process_depth_npz(
         fps: Frames per second for output video (default: 24.0)
         target_frames: Target number of frames (if None, uses all frames from npz)
         target_duration: Target duration in seconds (if None, calculated from frames and fps)
+        scene_timestamps: List of scene start timestamps for per-scene normalization
+    
+    Returns:
+        dict with processed scene statistics (min_depths, max_depths, screen_dists)
     """
     print(f"Loading depth data from: {input_npz}")
     
@@ -74,7 +79,7 @@ def process_depth_npz(
     # Process each frame
     processed_frames = []
     for frame_idx, depth_frame in enumerate(depths):
-        if frame_idx % 10 == 0:
+        if frame_idx % 100 == 0:
             print(f"Processing frame {frame_idx + 1}/{num_frames}...")
         
         # Apply Gaussian blur
@@ -99,13 +104,82 @@ def process_depth_npz(
     
     processed_frames = np.stack(processed_frames, axis=0)
     
-    # Normalize to 0-255 for video encoding
-    p_min = np.min(processed_frames)
-    p_max = np.max(processed_frames)
-    print(f"Processed depth range: [{p_min:.4f}, {p_max:.4f}]")
+    # Compute per-scene statistics on processed frames (before normalization)
+    processed_scene_stats = {
+        'min_depths': [],
+        'max_depths': [],
+        'screen_dists': []  # 35th percentile
+    }
     
-    depth_range = max(p_max - p_min, 1e-6)
-    normalized = ((processed_frames - p_min) / depth_range * 255.0).clip(0, 255).astype(np.uint8)
+    if scene_timestamps and len(scene_timestamps) > 0:
+        scene_frame_indices_stats = [int(ts * fps) for ts in scene_timestamps]
+        scene_frame_indices_stats.append(num_frames)  # Add end boundary
+        
+        for scene_idx in range(len(scene_timestamps)):
+            start_frame = scene_frame_indices_stats[scene_idx]
+            end_frame = scene_frame_indices_stats[scene_idx + 1]
+            
+            start_frame = max(0, min(start_frame, num_frames))
+            end_frame = max(0, min(end_frame, num_frames))
+            
+            if start_frame >= end_frame:
+                processed_scene_stats['min_depths'].append(0.0)
+                processed_scene_stats['max_depths'].append(1.0)
+                processed_scene_stats['screen_dists'].append(0.35)
+                continue
+            
+            scene_data = processed_frames[start_frame:end_frame]
+            p_min = float(np.min(scene_data))
+            p_max = float(np.max(scene_data))
+            p_35 = float(np.percentile(scene_data, 35))
+            
+            processed_scene_stats['min_depths'].append(p_min)
+            processed_scene_stats['max_depths'].append(p_max)
+            processed_scene_stats['screen_dists'].append(p_35)
+        
+        print(f"Computed processed scene statistics for {len(scene_timestamps)} scenes")
+    
+    # Normalize to 0-255 for video encoding
+    # Use per-scene normalization if scene_timestamps provided, otherwise global
+    if scene_timestamps and len(scene_timestamps) > 1:
+        print(f"Using per-scene normalization ({len(scene_timestamps)} scenes)")
+        
+        # Convert timestamps to frame indices
+        scene_frame_indices = [int(ts * fps) for ts in scene_timestamps]
+        scene_frame_indices.append(num_frames)  # Add end boundary
+        
+        normalized = np.zeros_like(processed_frames, dtype=np.uint8)
+        
+        for scene_idx in range(len(scene_timestamps)):
+            start_frame = scene_frame_indices[scene_idx]
+            end_frame = scene_frame_indices[scene_idx + 1]
+            
+            # Clamp to valid range
+            start_frame = max(0, min(start_frame, num_frames))
+            end_frame = max(0, min(end_frame, num_frames))
+            
+            if start_frame >= end_frame:
+                continue
+            
+            scene_data = processed_frames[start_frame:end_frame]
+            p_min = np.min(scene_data)
+            p_max = np.max(scene_data)
+            depth_range = max(p_max - p_min, 1e-6)
+            
+            normalized[start_frame:end_frame] = (
+                (scene_data - p_min) / depth_range * 255.0
+            ).clip(0, 255).astype(np.uint8)
+            
+            if scene_idx % 10 == 0:
+                print(f"  Scene {scene_idx + 1}: frames {start_frame}-{end_frame}, range [{p_min:.4f}, {p_max:.4f}]")
+    else:
+        print("Using global normalization")
+        p_min = np.min(processed_frames)
+        p_max = np.max(processed_frames)
+        print(f"Processed depth range: [{p_min:.4f}, {p_max:.4f}]")
+        
+        depth_range = max(p_max - p_min, 1e-6)
+        normalized = ((processed_frames - p_min) / depth_range * 255.0).clip(0, 255).astype(np.uint8)
     
     # Adjust frame count to match target if specified
     if target_frames is not None and target_frames != num_frames:
@@ -173,10 +247,18 @@ def process_depth_npz(
     
     print(f"Successfully saved processed depth video to: {output_video}")
     print(f"  Frames: {num_frames}, FPS: {fps:.6f}, Duration: {duration:.6f}s")
+    
+    return processed_scene_stats
 
 
-def update_metadata_with_postprocessing(metadata_file: Path, blur_sigma: float, log_base: float, sharpen: float) -> None:
-    """Update metadata.json with postprocessing section."""
+def update_metadata_with_postprocessing(
+    metadata_file: Path,
+    blur_sigma: float,
+    log_base: float,
+    sharpen: float,
+    processed_scene_stats: dict = None
+) -> None:
+    """Update metadata.json with postprocessing section and processed scene stats."""
     if not metadata_file.exists():
         raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
     
@@ -189,10 +271,21 @@ def update_metadata_with_postprocessing(metadata_file: Path, blur_sigma: float, 
         'sharpen': sharpen
     }
     
+    # Add processed scene statistics if provided
+    if processed_scene_stats:
+        if processed_scene_stats.get('min_depths'):
+            metadata['processed_scene_min_depths'] = processed_scene_stats['min_depths']
+        if processed_scene_stats.get('max_depths'):
+            metadata['processed_scene_max_depths'] = processed_scene_stats['max_depths']
+        if processed_scene_stats.get('screen_dists'):
+            metadata['processed_scene_screen_dists'] = processed_scene_stats['screen_dists']
+    
     with open(metadata_file, 'w') as f:
         json.dump(metadata, f, indent=2)
     
     print(f"Updated metadata.json with postprocessing section")
+    if processed_scene_stats and processed_scene_stats.get('min_depths'):
+        print(f"  Added processed scene stats for {len(processed_scene_stats['min_depths'])} scenes")
 
 
 def create_export_zip(output_dir: Path, rgb_video: Path, depth_video: Path, metadata_file: Path) -> None:
@@ -309,14 +402,18 @@ def main():
     target_frames = None
     target_duration = None
     
-    if fps is None:
-        # Try to get FPS from metadata.json
-        try:
-            with open(metadata_file, 'r') as f:
-                metadata = json.load(f)
+    # Load metadata for FPS and scene timestamps
+    scene_timestamps = None
+    try:
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+            if fps is None:
                 fps = metadata.get('fps')
-        except Exception as e:
-            print(f"Warning: Could not read fps from metadata.json: {e}")
+            scene_timestamps = metadata.get('scene_timestamps')
+            if scene_timestamps:
+                print(f"Loaded {len(scene_timestamps)} scene timestamps from metadata.json")
+    except Exception as e:
+        print(f"Warning: Could not read metadata.json: {e}")
     
     if fps is None and rgb_video.exists():
         # Extract FPS, duration, and frame count from reference video
@@ -373,7 +470,7 @@ def main():
         fps = 24.0 if fps is None else fps
     
     # Process depth npz
-    process_depth_npz(
+    processed_scene_stats = process_depth_npz(
         input_npz=input_npz,
         output_video=output_video,
         blur_sigma=args.blur_sigma,
@@ -382,14 +479,16 @@ def main():
         target_duration=target_duration,
         log_base=args.log_base,
         sharpen=args.sharpen,
+        scene_timestamps=scene_timestamps,
     )
     
-    # Update metadata with postprocessing info
+    # Update metadata with postprocessing info and scene stats
     update_metadata_with_postprocessing(
         metadata_file=metadata_file,
         blur_sigma=args.blur_sigma,
         log_base=args.log_base,
-        sharpen=args.sharpen
+        sharpen=args.sharpen,
+        processed_scene_stats=processed_scene_stats
     )
     
     # Create export.zip
