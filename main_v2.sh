@@ -1173,6 +1173,29 @@ EOF
     echo "========================================" | tee -a "$LOG_FILE"
     echo "" | tee -a "$LOG_FILE"
     
+    # Update metadata with per-scene depth statistics (min, max, screen_dist)
+    echo "Updating metadata with per-scene depth statistics..." | tee -a "$LOG_FILE"
+    if python3 "${SCRIPT_DIR}/update_scene_depth_metadata.py" "$ROOT_DIR" 2>&1 | tee -a "$LOG_FILE"; then
+        echo "✅ Metadata updated with scene depth stats" | tee -a "$LOG_FILE"
+    else
+        echo "⚠️  Warning: Failed to update metadata with depth stats (non-fatal)" | tee -a "$LOG_FILE"
+    fi
+    echo "" | tee -a "$LOG_FILE"
+    
+    # Create top-level depth.npz by concatenating scene npz files
+    # This runs BEFORE video stitching so depth.npz is created even if stitching fails
+    if [ ! -f "$DEPTH_NPZ" ]; then
+        echo "Creating top-level depth.npz from scene depth data..." | tee -a "$LOG_FILE"
+        if python3 "${SCRIPT_DIR}/create_depth_npz.py" "$ROOT_DIR" 2>&1 | tee -a "$LOG_FILE"; then
+            echo "✅ depth.npz created" | tee -a "$LOG_FILE"
+        else
+            echo "⚠️  Warning: Failed to create depth.npz (non-fatal)" | tee -a "$LOG_FILE"
+        fi
+    else
+        echo "depth.npz already exists, skipping creation" | tee -a "$LOG_FILE"
+    fi
+    echo "" | tee -a "$LOG_FILE"
+    
     # Verify all depth videos exist before stitching
     echo "Verifying all depth videos are ready..." | tee -a "$LOG_FILE"
     MISSING_DEPTH_VIDEOS=()
@@ -1273,8 +1296,10 @@ except Exception as e:
 # Use the EXACT same encoding parameters as RGB to ensure matching timebase
 print(f"Re-encoding depth video with exact encoding match (keeping resolution {depth_width}x{depth_height})...")
 # Use -vf fps= EXACTLY like rgb.mp4 encoding to get the same timebase
+# CRITICAL: Use -vframes to enforce exact frame count (prevents fps filter from adding extra frames)
 cmd = ['ffmpeg', '-i', temp_depth,
        '-vf', f'fps=fps={rgb_fps}',
+       '-vframes', str(rgb_frames),
        '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-crf', '18',
        '-y', depth_video]
 

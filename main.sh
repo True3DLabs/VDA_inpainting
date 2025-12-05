@@ -624,7 +624,7 @@ depth_video = "$DEPTH_VIDEO"
 depth_npz = "$DEPTH_NPZ"
 rgb_video = "$REFERENCE_VIDEO"
 metadata_file = "$METADATA_FILE"
-save_npz = $SAVE_NPZ
+save_npz = $([[ "$SAVE_NPZ" == "true" ]] && echo "True" || echo "False")
 
 with zipfile.ZipFile(export_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
     zipf.write(rgb_video, os.path.basename(rgb_video))
